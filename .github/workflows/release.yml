@@ -1,0 +1,48 @@
+# Builds the release executable on a clean GitHub runner when a version tag
+# (v0.1.0, v1.2.3, ...) is pushed, and publishes it as a GitHub Release
+# together with its SHA-256 checksum and the third-party notices.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v4
+
+      - name: Install the stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\sgcap.exe dist\
+          Copy-Item THIRD_PARTY_NOTICES.md dist\
+          $hash = (Get-FileHash dist\sgcap.exe -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path dist\sgcap.exe.sha256 -Value "$hash  sgcap.exe" -Encoding ascii
+          Get-Content dist\sgcap.exe.sha256
+
+      - name: Publish the GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            dist/sgcap.exe dist/sgcap.exe.sha256 dist/THIRD_PARTY_NOTICES.md `
+            --title "SgCap ${{ github.ref_name }}" `
+            --notes-file .github/release-notes.md `
+            --generate-notes

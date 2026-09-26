@@ -9,6 +9,21 @@ any application that accepts files or images (browser upload forms, mail, chat,
 Explorer, Office), click it to open the file, or right-click it for more options.
 After a few seconds it fades out on its own.
 
+## Download
+
+Prebuilt executables are attached to the
+[GitHub Releases](https://github.com/sebastienguillon/sg-cap/releases). Each one
+is built by GitHub Actions from the tagged source and comes with a SHA-256
+checksum. Requires 64-bit Windows 10 (1903 or later) or Windows 11; no runtime
+or installer is needed.
+
+> **The binary is currently unsigned.** Windows SmartScreen will show
+> "Windows protected your PC" on first launch: click *More info*, then
+> *Run anyway*. Browsers and antivirus software may also flag the download,
+> as screen-capture tools with global hotkeys are a frequent false positive.
+> Verify the file with `certutil -hashfile sgcap.exe SHA256` against the
+> checksum published with the release.
+
 ## Usage
 
 | Action | Default |
@@ -50,8 +65,13 @@ Tools C++ workload.
 cargo build --release
 ```
 
-The result is a single file, `target\release\sgcap.exe`. Copy it anywhere and
-run it; enable "Start with Windows" in the settings to keep it resident.
+The result is a single file, `target\release\sgcap.exe`, with the C runtime
+linked statically. Copy it anywhere and run it; enable "Start with Windows" in
+the settings to keep it resident.
+
+Releases are produced by the workflow in `.github/workflows/release.yml`:
+pushing a tag such as `v0.2.0` builds the executable on a clean runner and
+publishes it with its checksum and `THIRD_PARTY_NOTICES.md`.
 
 ## How it works
 
@@ -62,6 +82,11 @@ run it; enable "Start with Windows" in the settings to keep it resident.
 - PNG encoding and saving happen on a worker thread while the thumbnail is shown.
 - The thumbnail is a layered window; dragging it hands the receiving application a
   shell data object with the file, a bitmap and a PNG stream.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Bundled third-party code is listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Known limitations (MVP)
 
