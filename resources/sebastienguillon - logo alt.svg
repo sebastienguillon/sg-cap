@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 448 448" style="background-color:transparent;">
+	<g transform="translate(24,24)" clip-path="url(#logo-clip)">
+		<path d="
+			M 100,200
+			A 100,100 0 1,1 200,100
+			A 100,100 0 0,0 300,200
+			A 100,100 0 1,1 200,300
+			A 100,100 0 0,0 100,200
+			"
+			fill="#a8c70b" fill-opacity="0.25"
+		/>
+		<path d="
+			M 100,200
+			A 100,100 0 1,1 200,100
+			A 100,100 0 0,0 300,200
+			A 100,100 0 1,1 200,300
+			A 100,100 0 0,0 100,200
+
+			M 200,100
+			A 100,100 0 1,1 300,200
+
+			M 200,300
+			A 100,100 0 0,1 0,300
+			"
+			stroke="#a8c70b" stroke-width="40" fill="none"
+		/>
+		<line x1="380" y1="20" x2="405" y2="-5" stroke="#a8c70b" stroke-width="40"/>
+	</g>
+
+	<clipPath id="logo-clip">
+		<polygon fill="#000" points="-24,-24 424,-24 424,424 0,424 40,290 -24,290"/>
+	</clipPath>
+</svg>

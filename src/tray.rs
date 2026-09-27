@@ -2,17 +2,19 @@
 
 use std::ffi::c_void;
 
-use windows::core::w;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject, HGDIOBJ};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIIF_WARNING,
     NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu, GetSystemMetrics,
-    PostMessageW, SetForegroundWindow, TrackPopupMenuEx, HICON, ICONINFO, MF_SEPARATOR, MF_STRING,
-    SM_CXSMICON, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, WM_APP, WM_NULL,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu, GetSystemMetrics, LoadImageW,
+    PostMessageW, SetForegroundWindow, TrackPopupMenuEx, HICON, ICONINFO, IMAGE_ICON, LR_DEFAULTCOLOR,
+    MF_SEPARATOR, MF_STRING, SM_CXSMICON, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, WM_APP,
+    WM_NULL,
 };
 
 use crate::util::{log, wide, DibSection};
@@ -94,10 +96,37 @@ fn make_icon(size: i32) -> windows::core::Result<HICON> {
     }
 }
 
+/// Loads the application icon (resource id 1 in sgcap.rc) at the requested pixel size.
+pub fn load_app_icon(size: i32) -> Option<HICON> {
+    unsafe {
+        let module = GetModuleHandleW(None).ok()?;
+        let handle = LoadImageW(
+            Some(HINSTANCE(module.0)),
+            PCWSTR(1 as *const u16),
+            IMAGE_ICON,
+            size,
+            size,
+            LR_DEFAULTCOLOR,
+        )
+        .ok()?;
+        if handle.is_invalid() {
+            None
+        } else {
+            Some(HICON(handle.0))
+        }
+    }
+}
+
 impl Tray {
     pub fn new(hwnd: HWND) -> windows::core::Result<Tray> {
         let size = unsafe { GetSystemMetrics(SM_CXSMICON) };
-        let icon = make_icon(size)?;
+        let icon = match load_app_icon(size) {
+            Some(icon) => icon,
+            None => {
+                log("tray: icon resource missing, using the drawn fallback");
+                make_icon(size)?
+            }
+        };
         let tray = Tray { hwnd, icon };
         tray.add()?;
         Ok(tray)

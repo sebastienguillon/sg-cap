@@ -109,9 +109,11 @@ $after = Get-ChildItem $desktop -Filter "Screenshot *.png" -ErrorAction Silently
 "new files: " + (($after | ForEach-Object { "$($_.Name) [$($_.Length) bytes]" }) -join "; ")
 if ($after) { Copy-Item $after[0].FullName (Join-Path $Out "t4_saved.png") -Force }
 
-# Thumbnail should vanish after ~5 s
-Start-Sleep -Seconds 6
-"thumbnail gone: " + ([Native]::FindWindowW("SgCapThumb", [IntPtr]::Zero) -eq [IntPtr]::Zero)
+# Thumbnail should vanish after the configured delay (settings.json, default 5 s)
+$delay = 5
+try { $cfg = Get-Content (Join-Path $env:APPDATA "SgCap\settings.json") -Raw | ConvertFrom-Json; if ($cfg.thumbnail_seconds) { $delay = [int]$cfg.thumbnail_seconds } } catch {}
+Start-Sleep -Seconds ($delay + 1)
+"thumbnail gone after $delay s: " + ([Native]::FindWindowW("SgCapThumb", [IntPtr]::Zero) -eq [IntPtr]::Zero)
 
 [void][Native]::SetCursorPos($orig.X, $orig.Y)
 "--- log tail"

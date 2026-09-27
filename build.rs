@@ -8,6 +8,12 @@ fn main() {
             .dpi_awareness(DpiAwareness::PerMonitorV2)
             .requested_execution_level(ExecutionLevel::AsInvoker);
         embed_manifest(manifest).expect("unable to embed manifest");
+        // Application icon (resources/sgcap.ico), compiled with the SDK resource compiler.
+        embed_resource::compile("resources/sgcap.rc", embed_resource::NONE)
+            .manifest_required()
+            .expect("unable to compile resources/sgcap.rc");
     }
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=resources/sgcap.rc");
+    println!("cargo:rerun-if-changed=resources/sgcap.ico");
 }

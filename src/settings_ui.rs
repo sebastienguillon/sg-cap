@@ -485,6 +485,8 @@ pub fn open(hinst: HINSTANCE, main_hwnd: HWND, settings: &Settings) -> windows::
             lpfnWndProc: Some(wndproc),
             hInstance: hinst,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hIcon: crate::tray::load_app_icon(32).unwrap_or_default(),
+            hIconSm: crate::tray::load_app_icon(16).unwrap_or_default(),
             hbrBackground: HBRUSH((COLOR_3DFACE.0 + 1) as usize as *mut c_void),
             lpszClassName: CLASS_NAME,
             ..Default::default()

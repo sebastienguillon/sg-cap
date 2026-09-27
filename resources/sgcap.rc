@@ -1,0 +1,3 @@
+// Application icon. Resource id 1 is also loaded at runtime for the tray icon
+// and the settings window.
+1 ICON "sgcap.ico"

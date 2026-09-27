@@ -228,6 +228,15 @@ fn apply_settings(startup_phase: bool) {
     let Some((hwnd, s)) = with_app(|a| (a.hwnd, a.settings.clone())) else {
         return;
     };
+    log(&format!(
+        "settings: region \"{}\", screen \"{}\", thumbnail {} s, folder \"{}\", clipboard {}, startup {}",
+        s.region_hotkey,
+        s.screen_hotkey,
+        s.thumbnail_seconds,
+        s.resolved_save_folder().display(),
+        s.copy_to_clipboard,
+        s.start_with_windows
+    ));
     HotKey::unregister(hwnd, HOTKEY_REGION);
     HotKey::unregister(hwnd, HOTKEY_SCREEN);
     let mut problems = Vec::new();

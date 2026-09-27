@@ -1,3 +1,5 @@
+<img src="resources/sebastienguillon%20-%20logo%20alt.svg" alt="SgCap logo" width="96" align="right">
+
 # SgCap
 
 macOS-style screen capture for Windows 10 and 11, written in Rust with no runtime

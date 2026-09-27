@@ -46,6 +46,7 @@ features = [
 
 [build-dependencies]
 embed-manifest = "1.5"
+embed-resource = "3.0"
 
 # Dev builds: light optimisation so pixel loops are usable, deps optimised.
 [profile.dev]
