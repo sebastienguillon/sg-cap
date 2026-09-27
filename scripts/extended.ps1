@@ -53,6 +53,10 @@ function WaitThumbs([int]$n, [int]$ms) { for ($i = 0; $i -lt ($ms / 20); $i++) {
 
 $desktop = [Environment]::GetFolderPath("Desktop")
 $before = Get-ChildItem $desktop -Filter "Screenshot *.png" | Select-Object -ExpandProperty Name
+# Thumbnail delay from settings.json (default 12 s)
+$delay = 12
+try { $cfg = Get-Content (Join-Path $env:APPDATA "SgCap\settings.json") -Raw | ConvertFrom-Json; if ($cfg.thumbnail_seconds) { $delay = [int]$cfg.thumbnail_seconds } } catch {}
+"thumbnail delay: $delay s"
 Get-Process sgcap -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 300
 Remove-Item Env:SGCAP_DUMP_THUMB -ErrorAction SilentlyContinue
@@ -80,12 +84,12 @@ $thumbs = [NE]::ByClass("SgCapThumb")
 $newest = $thumbs | Sort-Object { (GetRect $_).Top } -Descending | Select-Object -First 1
 $r = GetRect $newest; $cx = [int](($r.Left + $r.Right) / 2); $cy = [int](($r.Top + $r.Bottom) / 2)
 [void][NE]::SetCursorPos($cx, $cy); Start-Sleep -Milliseconds 100; [NE]::mouse_event(0x0001, 1, 0, 0, [UIntPtr]::Zero)
-Start-Sleep -Seconds 7
-"hovered thumb still alive after 7 s: " + ([NE]::IsWindowVisible($newest))
+Start-Sleep -Seconds ($delay + 2)
+"hovered thumb still alive after $($delay + 2) s: " + ([NE]::IsWindowVisible($newest))
 "older thumb gone meanwhile: " + (([NE]::ByClass("SgCapThumb")).Count -eq 1)
 [void][NE]::SetCursorPos(600, 600); [NE]::mouse_event(0x0001, 1, 0, 0, [UIntPtr]::Zero)
-Start-Sleep -Milliseconds 6500
-"gone 6.5 s after leaving: " + (([NE]::ByClass("SgCapThumb")).Count -eq 0)
+Start-Sleep -Milliseconds (($delay + 1.5) * 1000)
+"gone $($delay + 1.5) s after leaving: " + (([NE]::ByClass("SgCapThumb")).Count -eq 0)
 
 "--- 4. context menu"
 DragRegion 900 300 1200 500
@@ -102,7 +106,7 @@ Start-Sleep -Milliseconds 500
 Start-Sleep -Milliseconds 300
 [void][NE]::SetCursorPos(600, 600); [NE]::mouse_event(0x0001, 1, 0, 0, [UIntPtr]::Zero)
 "thumb alive after menu closed: " + ([NE]::IsWindowVisible($t))
-Start-Sleep -Milliseconds 6500
+Start-Sleep -Milliseconds (($delay + 1.5) * 1000)
 "thumb gone later: " + (([NE]::ByClass("SgCapThumb")).Count -eq 0)
 
 "--- 5. settings window via tray command"

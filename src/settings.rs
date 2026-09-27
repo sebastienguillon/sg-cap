@@ -24,7 +24,7 @@ impl Default for Settings {
         Settings {
             region_hotkey: "Ctrl+Shift+4".to_string(),
             screen_hotkey: "Ctrl+Shift+3".to_string(),
-            thumbnail_seconds: 5,
+            thumbnail_seconds: 12,
             save_folder: String::new(),
             copy_to_clipboard: false,
             start_with_windows: false,
