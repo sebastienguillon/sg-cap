@@ -327,11 +327,18 @@ fn capture_screen() {
         return;
     }
     let mon = monitor_at(cursor_pos());
+    let t0 = std::time::Instant::now();
     let mut grabbed = None;
-    with_thumbs_hidden(|| match capture::grab(mon.rect) {
+    with_thumbs_hidden(|| match capture::grab_fast(mon.rect) {
         Ok(dib) => grabbed = Some(capture::whole(&dib)),
         Err(e) => log(&format!("screen capture failed: {e}")),
     });
+    log(&format!(
+        "screen: {}x{} grab {} ms",
+        util::rect_w(&mon.rect),
+        util::rect_h(&mon.rect),
+        t0.elapsed().as_millis()
+    ));
     if let Some(image) = grabbed {
         process_capture(image);
     }
