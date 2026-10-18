@@ -8,8 +8,8 @@ dependencies.
 Press the hotkey, drag a rectangle, and the capture is saved as PNG right away. A
 thumbnail slides into the bottom-right corner of the screen; you can drag it into
 any application that accepts files or images (browser upload forms, mail, chat,
-Explorer, Office), click it to open the file, or right-click it for more options.
-After a few seconds it fades out on its own.
+Explorer, Office), click it to annotate the capture, or right-click it for more
+options. After a few seconds it fades out on its own.
 
 ## Download
 
@@ -35,9 +35,30 @@ or installer is needed.
 | Cancel a region capture | `Esc` or right-click |
 | Move the selection while dragging | hold `Space` |
 | Thumbnail: drag into another app | left-drag |
-| Thumbnail: open the file | click |
-| Thumbnail: copy image, show in folder, delete, dismiss | right-click |
+| Thumbnail: annotate | click |
+| Thumbnail: open, copy image, show in folder, delete, dismiss | right-click |
 | Thumbnail: keep it on screen | hover it |
+
+## Annotating
+
+Clicking a thumbnail opens the capture in an editor, like Markup on macOS. Drag on
+the image to draw a line, an arrow, a rectangle or an ellipse with the chosen width
+and colour. Click a shape to select it, then drag it or its handles, or pick another
+width or colour to restyle it. **Done** writes the annotations into the PNG (the
+file is replaced) and slides a new thumbnail in, ready to be dragged; **Cancel**
+leaves the file as it was. The last tool, width and colour are remembered.
+
+| Action | Key |
+|---|---|
+| Line, arrow, rectangle, ellipse | `L`, `A`, `R`, `E` |
+| Width presets | `1` to `4` |
+| 45° lines, squares and circles, straight moves | hold `Shift` |
+| Undo, redo | `Ctrl+Z`, `Ctrl+Y` (or `Ctrl+Shift+Z`) |
+| Delete the selected shape | `Delete` or `Backspace` |
+| Nudge the selected shape | arrow keys (`Shift` for 10 px) |
+| Copy the annotated image | `Ctrl+C` |
+| Done | `Enter` or `Ctrl+S` |
+| Deselect, then cancel | `Esc` |
 
 SgCap lives in the notification area. Its icon menu offers the two captures,
 the settings window, the save folder and Quit. Left-clicking the icon starts a
@@ -84,6 +105,8 @@ publishes it with its checksum and `THIRD_PARTY_NOTICES.md`.
 - PNG encoding and saving happen on a worker thread while the thumbnail is shown.
 - The thumbnail is a layered window; dragging it hands the receiving application a
   shell data object with the file, a bitmap and a PNG stream.
+- The annotation editor keeps shapes as vectors until Done and draws them with
+  Direct2D; the saved image is rendered at full resolution with the same strokes.
 
 ## License
 

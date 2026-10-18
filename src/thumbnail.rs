@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -22,7 +22,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, GetCursorPos,
     GetSystemMetrics, GetWindowLongPtrW, KillTimer, PostMessageW, RegisterClassExW, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, ShowWindow, TrackPopupMenuEx, UpdateLayeredWindow,
+    SetMenuDefaultItem, SetTimer, SetWindowLongPtrW, ShowWindow, TrackPopupMenuEx, UpdateLayeredWindow,
     GWLP_USERDATA, MA_NOACTIVATE, MF_SEPARATOR, MF_STRING, SM_CXDRAG, SM_CYDRAG, SW_SHOWNOACTIVATE,
     SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP, WM_DESTROY,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCDESTROY, WM_NULL, WM_RBUTTONUP,
@@ -31,12 +31,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::capture::Image;
 use crate::dragdrop;
+use crate::editor::{EditRequest, PendingFile, WM_APP_EDIT_REQUEST};
 use crate::thumb_image::ThumbImage;
 use crate::util::{ease_in_cubic, ease_out_cubic, get_x, get_y, log, wide, DibSection, MemDc};
 
 pub const WM_APP_THUMB_CLOSED: u32 = WM_APP + 4;
 /// lparam = new bottom edge (screen y) of the thumbnail content.
 pub const WM_APP_THUMB_MOVE: u32 = WM_APP + 6;
+/// Main window -> thumbnail (SendMessage): when its PNG could not be saved,
+/// returns a Box<Arc<Image>> pointer (the only copy), else 0.
+pub const WM_APP_THUMB_UNSAVED: u32 = WM_APP + 15;
 
 pub type FileResult = Result<(PathBuf, Arc<Vec<u8>>), String>;
 
@@ -62,6 +66,8 @@ const CMD_COPY: u32 = 301;
 const CMD_SHOW: u32 = 302;
 const CMD_DELETE: u32 = 303;
 const CMD_DISMISS: u32 = 304;
+const CMD_ANNOTATE: u32 = 305;
+const CMD_OPEN: u32 = 306;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
@@ -160,11 +166,38 @@ fn begin_slide_out(hwnd: HWND, s: &mut State) {
 }
 
 fn start_countdown(hwnd: HWND, s: &State) {
-    if s.hovered || s.in_drag || s.menu_open || s.phase != Phase::Idle {
+    // After a failed save the thumbnail holds the only copy: it stays.
+    if s.hovered || s.in_drag || s.menu_open || s.phase != Phase::Idle || s.file_err.is_some() {
         return;
     }
     unsafe {
         SetTimer(Some(hwnd), TIMER_COUNTDOWN, s.countdown_ms.max(500), None);
+    }
+}
+
+/// Picks up the save result as soon as the worker has it; a failure stops
+/// the countdown (see start_countdown).
+fn poll_file(hwnd: HWND, s: &mut State) {
+    if s.file.is_some() || s.file_err.is_some() {
+        return;
+    }
+    let Some(rx) = &s.rx else {
+        return;
+    };
+    let result = match rx.try_recv() {
+        Ok(r) => r,
+        Err(TryRecvError::Empty) => return,
+        Err(TryRecvError::Disconnected) => Err("worker thread ended".to_string()),
+    };
+    s.rx = None;
+    match result {
+        Ok(f) => s.file = Some(f),
+        Err(e) => {
+            s.file_err = Some(e);
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TIMER_COUNTDOWN);
+            }
+        }
     }
 }
 
@@ -182,6 +215,37 @@ fn ensure_file(s: &mut State) -> Option<(PathBuf, Arc<Vec<u8>>)> {
         }
     }
     s.file.clone()
+}
+
+/// Hands the capture to the main window, which opens the annotation editor.
+/// The PNG may still be being written: the editor takes the pending result
+/// instead of the UI thread waiting for the encode here.
+fn request_edit(s: &mut State) {
+    let file = match (&s.file, &s.file_err) {
+        (Some(f), _) => PendingFile::Ready(Some(f.clone())),
+        (None, Some(_)) => PendingFile::Ready(None),
+        (None, None) => match s.rx.take() {
+            Some(rx) => PendingFile::Saving(rx),
+            None => PendingFile::Ready(None),
+        },
+    };
+    let anchor = POINT {
+        x: s.x + s.thumb.pad + s.thumb.content_w / 2,
+        y: s.target_y + s.thumb.pad + s.thumb.content_h / 2,
+    };
+    let req = Box::new(EditRequest {
+        image: s.image.clone(),
+        file,
+        capture_scale: s.scale,
+        anchor,
+    });
+    unsafe {
+        let raw = Box::into_raw(req);
+        if PostMessageW(Some(s.main_hwnd), WM_APP_EDIT_REQUEST, WPARAM(0), LPARAM(raw as isize)).is_err() {
+            drop(Box::from_raw(raw));
+            log("thumb: cannot post the edit request");
+        }
+    }
 }
 
 fn shell_open(file: &str, params: Option<&str>) {
@@ -229,6 +293,7 @@ impl Thumbnail {
             let Ok(mut s) = self.state.try_borrow_mut() else {
                 return;
             };
+            poll_file(self.hwnd, &mut s);
             let slide = SLIDE_DIST * s.scale;
             match s.phase {
                 Phase::SlideIn(t0) => {
@@ -334,6 +399,9 @@ impl Thumbnail {
             let Ok(menu) = CreatePopupMenu() else {
                 return;
             };
+            let _ = AppendMenuW(menu, MF_STRING, CMD_ANNOTATE as usize, w!("Annotate"));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN as usize, w!("Open"));
+            let _ = SetMenuDefaultItem(menu, CMD_ANNOTATE, 0);
             let _ = AppendMenuW(menu, MF_STRING, CMD_COPY as usize, w!("Copy image"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_SHOW as usize, w!("Show in folder"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_DELETE as usize, w!("Delete"));
@@ -352,6 +420,17 @@ impl Thumbnail {
         };
         s.menu_open = false;
         match cmd {
+            CMD_ANNOTATE => {
+                request_edit(&mut s);
+                begin_slide_out(hwnd, &mut s);
+            }
+            CMD_OPEN => {
+                // Without a file (failed save) the thumbnail is the only copy: it stays.
+                if let Some((path, _)) = ensure_file(&mut s) {
+                    shell_open(&path.to_string_lossy(), None);
+                    begin_slide_out(hwnd, &mut s);
+                }
+            }
             CMD_COPY => {
                 let png = ensure_file(&mut s).map(|(_, p)| p);
                 if let Err(e) = dragdrop::copy_to_clipboard(hwnd, &s.image, png.as_deref().map(|v| v.as_slice())) {
@@ -362,8 +441,8 @@ impl Thumbnail {
             CMD_SHOW => {
                 if let Some((path, _)) = ensure_file(&mut s) {
                     shell_open("explorer.exe", Some(&format!("/select,\"{}\"", path.display())));
+                    begin_slide_out(hwnd, &mut s);
                 }
-                begin_slide_out(hwnd, &mut s);
             }
             CMD_DELETE => {
                 if let Some((path, _)) = ensure_file(&mut s) {
@@ -387,7 +466,15 @@ impl Thumbnail {
                         TIMER_COUNTDOWN => {
                             let _ = KillTimer(Some(hwnd), TIMER_COUNTDOWN);
                             if let Ok(mut s) = self.state.try_borrow_mut() {
-                                if s.phase == Phase::Idle && !s.hovered && !s.in_drag && !s.menu_open {
+                                if s.rx.is_some() {
+                                    // Still saving: only go once the save is known to have worked.
+                                    SetTimer(Some(hwnd), TIMER_COUNTDOWN, 500, None);
+                                } else if s.phase == Phase::Idle
+                                    && !s.hovered
+                                    && !s.in_drag
+                                    && !s.menu_open
+                                    && s.file_err.is_none()
+                                {
                                     begin_slide_out(hwnd, &mut s);
                                 }
                             }
@@ -458,11 +545,9 @@ impl Thumbnail {
                 WM_LBUTTONUP => {
                     let _ = ReleaseCapture();
                     if let Ok(mut s) = self.state.try_borrow_mut() {
-                        if s.pressed.take().is_some() && !s.in_drag {
-                            // Click: open the file in the default viewer, then go away.
-                            if let Some((path, _)) = ensure_file(&mut s) {
-                                shell_open(&path.to_string_lossy(), None);
-                            }
+                        if s.pressed.take().is_some() && !s.in_drag && !matches!(s.phase, Phase::SlideOut(_)) {
+                            // Click: open the annotation editor (macOS Markup), then go away.
+                            request_edit(&mut s);
                             begin_slide_out(hwnd, &mut s);
                         }
                     }
@@ -471,6 +556,15 @@ impl Thumbnail {
                 WM_RBUTTONUP => {
                     self.context_menu();
                     Some(LRESULT(0))
+                }
+                WM_APP_THUMB_UNSAVED => {
+                    let raw = match self.state.try_borrow() {
+                        Ok(s) if s.file_err.is_some() && !matches!(s.phase, Phase::SlideOut(_)) => {
+                            Box::into_raw(Box::new(s.image.clone())) as isize
+                        }
+                        _ => 0,
+                    };
+                    Some(LRESULT(raw))
                 }
                 WM_APP_THUMB_MOVE => {
                     if let Ok(mut s) = self.state.try_borrow_mut() {

@@ -14,6 +14,8 @@ path = "src/main.rs"
 
 [dependencies]
 png = "0.18"
+# Vector2 / Matrix3x2 used by the Direct2D bindings (part of windows-rs).
+windows-numerics = "0.3"
 
 [dependencies.windows]
 version = "0.62"
@@ -21,6 +23,9 @@ features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
@@ -30,6 +35,7 @@ features = [
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
     "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
     "Win32_UI_HiDpi",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",

@@ -21,7 +21,7 @@ const BORDER_COLOR: [f32; 3] = [250.0, 250.0, 250.0]; // B, G, R
 const SHADOW_STRENGTH: f32 = 0.55;
 
 /// Area-averaging downscale of a BGRA image to tw x th (returns BGRx).
-fn downscale(img: &Image, tw: usize, th: usize) -> Vec<u8> {
+pub fn downscale(img: &Image, tw: usize, th: usize) -> Vec<u8> {
     let w = img.width as usize;
     let h = img.height as usize;
     let src = &img.bgra;

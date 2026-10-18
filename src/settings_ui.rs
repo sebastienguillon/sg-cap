@@ -51,6 +51,7 @@ const CLIENT_H: i32 = 262;
 
 thread_local! {
     static CURRENT: Cell<isize> = const { Cell::new(0) };
+    static CLASS_REGISTERED: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn current_hwnd() -> HWND {
@@ -309,6 +310,8 @@ impl Ui {
             }
             std::fs::create_dir_all(&folder).map_err(|e| format!("Cannot use folder \"{folder}\": {e}"))?;
             let checked = |id: i32| SendMessageW(self.control(id), BM_GETCHECK, None, None).0 as u32 == BST_CHECKED.0;
+            // Fields this window does not show (the editor's last tool, colour
+            // and width) keep their current values from disk.
             Ok(Settings {
                 region_hotkey: region.display(),
                 screen_hotkey: screen.map(|h| h.display()).unwrap_or_default(),
@@ -316,6 +319,7 @@ impl Ui {
                 save_folder: folder,
                 copy_to_clipboard: checked(ID_CLIPBOARD),
                 start_with_windows: checked(ID_STARTUP),
+                ..Settings::load()
             })
         }
     }
@@ -480,18 +484,20 @@ pub fn open(hinst: HINSTANCE, main_hwnd: HWND, settings: &Settings) -> windows::
         return Ok(());
     }
     unsafe {
-        let wc = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(wndproc),
-            hInstance: hinst,
-            hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hIcon: crate::tray::load_app_icon(32).unwrap_or_default(),
-            hIconSm: crate::tray::load_app_icon(16).unwrap_or_default(),
-            hbrBackground: HBRUSH((COLOR_3DFACE.0 + 1) as usize as *mut c_void),
-            lpszClassName: CLASS_NAME,
-            ..Default::default()
-        };
-        RegisterClassExW(&wc);
+        if !CLASS_REGISTERED.with(|c| c.replace(true)) {
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(wndproc),
+                hInstance: hinst,
+                hCursor: LoadCursorW(None, IDC_ARROW)?,
+                hIcon: crate::tray::load_app_icon(32).unwrap_or_default(),
+                hIconSm: crate::tray::load_app_icon(16).unwrap_or_default(),
+                hbrBackground: HBRUSH((COLOR_3DFACE.0 + 1) as usize as *mut c_void),
+                lpszClassName: CLASS_NAME,
+                ..Default::default()
+            };
+            RegisterClassExW(&wc);
+        }
 
         let mon = monitor_at(cursor_pos());
         let mut dpi = 96u32;

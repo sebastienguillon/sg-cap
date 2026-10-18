@@ -1,6 +1,7 @@
 //! Settings persisted as a flat JSON file in %APPDATA%\SgCap\settings.json.
 
 use std::ffi::c_void;
+use std::io::Write;
 use std::path::PathBuf;
 
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -17,6 +18,12 @@ pub struct Settings {
     pub save_folder: String,
     pub copy_to_clipboard: bool,
     pub start_with_windows: bool,
+    /// Last annotation tool used in the editor ("line", "arrow", "rect", "ellipse").
+    pub annotate_tool: String,
+    /// Last annotation colour, 0xRRGGBB.
+    pub annotate_color: u32,
+    /// Last annotation stroke width, in points (scaled by the capture DPI).
+    pub annotate_width: u32,
 }
 
 impl Default for Settings {
@@ -28,6 +35,9 @@ impl Default for Settings {
             save_folder: String::new(),
             copy_to_clipboard: false,
             start_with_windows: false,
+            annotate_tool: "arrow".to_string(),
+            annotate_color: 0xFF3B30,
+            annotate_width: 4,
         }
     }
 }
@@ -38,10 +48,20 @@ impl Settings {
     }
 
     pub fn load() -> Settings {
+        Self::try_load().unwrap_or_else(|e| {
+            log(&format!("settings: {e}, using defaults"));
+            Settings::default()
+        })
+    }
+
+    /// Defaults when there is no file yet; an error when it exists but cannot
+    /// be read or parsed (so callers do not overwrite it with defaults).
+    pub fn try_load() -> Result<Settings, String> {
         let mut s = Settings::default();
         let text = match std::fs::read_to_string(Self::path()) {
             Ok(t) => t,
-            Err(_) => return s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(s),
+            Err(e) => return Err(format!("cannot read {}: {e}", Self::path().display())),
         };
         match parse_flat_json(&text) {
             Ok(pairs) => {
@@ -55,27 +75,46 @@ impl Settings {
                         ("save_folder", JsonVal::Str(v)) => s.save_folder = v,
                         ("copy_to_clipboard", JsonVal::Bool(v)) => s.copy_to_clipboard = v,
                         ("start_with_windows", JsonVal::Bool(v)) => s.start_with_windows = v,
+                        ("annotate_tool", JsonVal::Str(v)) => s.annotate_tool = v,
+                        ("annotate_color", JsonVal::Str(v)) => {
+                            if let Some(c) = parse_hex_color(&v) {
+                                s.annotate_color = c;
+                            }
+                        }
+                        ("annotate_width", JsonVal::Num(v)) => {
+                            s.annotate_width = (v.round() as i64).clamp(1, 50) as u32
+                        }
                         _ => {}
                     }
                 }
             }
-            Err(e) => log(&format!("settings: parse error, using defaults: {e}")),
+            Err(e) => return Err(format!("parse error: {e}")),
         }
-        s
+        Ok(s)
     }
 
     pub fn save(&self) -> std::io::Result<()> {
         let _ = std::fs::create_dir_all(app_data_dir());
         let text = format!(
-            "{{\n  \"region_hotkey\": \"{}\",\n  \"screen_hotkey\": \"{}\",\n  \"thumbnail_seconds\": {},\n  \"save_folder\": \"{}\",\n  \"copy_to_clipboard\": {},\n  \"start_with_windows\": {}\n}}\n",
+            "{{\n  \"region_hotkey\": \"{}\",\n  \"screen_hotkey\": \"{}\",\n  \"thumbnail_seconds\": {},\n  \"save_folder\": \"{}\",\n  \"copy_to_clipboard\": {},\n  \"start_with_windows\": {},\n  \"annotate_tool\": \"{}\",\n  \"annotate_color\": \"#{:06X}\",\n  \"annotate_width\": {}\n}}\n",
             json_escape(&self.region_hotkey),
             json_escape(&self.screen_hotkey),
             self.thumbnail_seconds,
             json_escape(&self.save_folder),
             self.copy_to_clipboard,
-            self.start_with_windows
+            self.start_with_windows,
+            json_escape(&self.annotate_tool),
+            self.annotate_color & 0xFF_FFFF,
+            self.annotate_width
         );
-        std::fs::write(Self::path(), text)
+        // Written next to it and flushed, then renamed over it: never a
+        // half-written or empty file, even after a power cut.
+        let tmp = Self::path().with_extension("json.tmp");
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, Self::path())
     }
 
     pub fn resolved_save_folder(&self) -> PathBuf {
@@ -85,6 +124,15 @@ impl Settings {
             PathBuf::from(self.save_folder.trim())
         }
     }
+}
+
+/// "#RRGGBB" (or "RRGGBB") to 0xRRGGBB.
+fn parse_hex_color(s: &str) -> Option<u32> {
+    let h = s.trim().trim_start_matches('#');
+    if h.len() != 6 {
+        return None;
+    }
+    u32::from_str_radix(h, 16).ok()
 }
 
 pub fn desktop_dir() -> PathBuf {

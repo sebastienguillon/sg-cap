@@ -7,6 +7,7 @@ use windows::Win32::Graphics::Gdi::{
     BitBlt, GdiFlush, GetMonitorInfoW, MonitorFromPoint, SelectObject, HMONITOR, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, SRCCOPY,
 };
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN,
@@ -59,6 +60,18 @@ pub fn monitor_at(pt: POINT) -> MonitorInfo {
             work: mi.rcWork,
         }
     }
+}
+
+/// Effective DPI of a monitor (96 when unknown).
+pub fn monitor_dpi(handle: HMONITOR) -> u32 {
+    let mut dx = 96u32;
+    let mut dy = 96u32;
+    unsafe {
+        if GetDpiForMonitor(handle, MDT_EFFECTIVE_DPI, &mut dx, &mut dy).is_err() || dx == 0 {
+            return 96;
+        }
+    }
+    dx
 }
 
 pub fn cursor_pos() -> POINT {
