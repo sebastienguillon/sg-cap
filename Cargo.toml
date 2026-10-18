@@ -1,6 +1,6 @@
 [package]
 name = "sgcap"
-version = "0.1.0"
+version = "2026.10.0"
 edition = "2021"
 description = "macOS-style screen capture for Windows: hotkey, region selection, draggable thumbnail, auto-save"
 license = "MIT"

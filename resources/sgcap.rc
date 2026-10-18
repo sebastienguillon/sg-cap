@@ -1,3 +1,37 @@
+#pragma code_page(65001)
+#include <winver.h>
+#include "sgcap_version.h"
+
 // Application icon. Resource id 1 is also loaded at runtime for the tray icon
 // and the settings window.
 1 ICON "sgcap.ico"
+
+// Version shown in Explorer (Properties > Details) and by installers. The numbers
+// come from Cargo.toml through sgcap_version.h, which build.rs writes to OUT_DIR.
+1 VERSIONINFO
+FILEVERSION SGCAP_VERSION_BIN
+PRODUCTVERSION SGCAP_VERSION_BIN
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "SgCap"
+            VALUE "FileVersion", SGCAP_VERSION_STR
+            VALUE "InternalName", "sgcap"
+            VALUE "LegalCopyright", "Copyright (c) 2026 Sébastien Guillon"
+            VALUE "OriginalFilename", "sgcap.exe"
+            VALUE "ProductName", "SgCap"
+            VALUE "ProductVersion", SGCAP_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

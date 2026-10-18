@@ -1,6 +1,7 @@
 # Builds the release executable on a clean GitHub runner when a version tag
-# (v0.1.0, v1.2.3, ...) is pushed, and publishes it as a GitHub Release
-# together with its SHA-256 checksum and the third-party notices.
+# (v2026.10.0, v2026.10.1, ...) is pushed, and publishes it as a GitHub Release
+# together with its SHA-256 checksum and the third-party notices. The tag must
+# match the version in Cargo.toml, which is embedded in the executable.
 name: Release
 
 on:
@@ -22,6 +23,14 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
+
+      - name: Check that the tag matches the Cargo.toml version
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ("${{ github.ref_name }}" -ne "v$version") {
+            throw "Tag ${{ github.ref_name }} does not match the Cargo.toml version $version"
+          }
 
       - name: Build
         run: cargo build --release --locked

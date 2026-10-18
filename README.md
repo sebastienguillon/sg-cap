@@ -97,9 +97,13 @@ The result is a single file, `target\release\sgcap.exe`, with the C runtime
 linked statically. Copy it anywhere and run it; enable "Start with Windows" in
 the settings to keep it resident.
 
-Releases are produced by the workflow in `.github/workflows/release.yml`:
-pushing a tag such as `v0.2.0` builds the executable on a clean runner and
-publishes it with its checksum and `THIRD_PARTY_NOTICES.md`.
+Versions follow calendar versioning, `YYYY.M.MICRO`: the year and month of the
+release, then a counter that starts at 0 each month (`2026.10.0`, `2026.10.1`,
+then `2026.11.0`). Releases are produced by the workflow in
+`.github/workflows/release.yml`: set the version in `Cargo.toml`, then push the
+matching tag, such as `v2026.10.0`. The workflow checks that they match, builds
+the executable on a clean runner and publishes it with its checksum and
+`THIRD_PARTY_NOTICES.md`.
 
 ## How it works
 

@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "sgcap"
-version = "0.1.0"
+version = "2026.10.0"
 dependencies = [
  "embed-manifest",
  "embed-resource",
