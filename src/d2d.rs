@@ -9,8 +9,8 @@ use std::ffi::c_void;
 use windows::core::{w, Interface, Result, PCWSTR};
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED,
-    D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U,
+    D2D1_ALPHA_MODE, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_BEGIN_HOLLOW,
+    D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1DeviceContext, ID2D1Factory, ID2D1HwndRenderTarget,
@@ -18,17 +18,20 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
     D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_ROUND,
     D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE,
-    D2D1_DASH_STYLE_SOLID, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+    D2D1_DASH_STYLE_SOLID, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_FEATURE_LEVEL_DEFAULT, D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
     D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_LINE_JOIN_MITER, D2D1_LINE_JOIN_ROUND,
-    D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE,
-    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE,
-    D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    D2D1_PRESENT_OPTIONS_NONE, D2D1_QUADRATIC_BEZIER_SEGMENT, D2D1_RENDER_TARGET_PROPERTIES,
+    D2D1_RENDER_TARGET_TYPE, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+    D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES,
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
-    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED,
+    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL,
+    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_HIT_TEST_METRICS, DWRITE_LINE_METRICS, DWRITE_MEASURING_MODE_NATURAL,
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_METRICS,
     DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -36,8 +39,11 @@ use windows::Win32::Graphics::Gdi::{GdiFlush, SelectObject};
 use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::capture::Image;
-use crate::shapes::{arrow_head, Kind, Pt, Shape};
+use crate::shapes::{arrow_head, corner_cut, Kind, Mosaic, Pt, Shape};
 use crate::util::{log, DibSection, MemDc};
+
+/// Opacity of highlighter strokes: what is underneath stays readable.
+pub const HIGHLIGHTER_ALPHA: f32 = 0.4;
 
 /// Device-independent resources (factories, stroke styles), one set per UI thread.
 #[derive(Clone)]
@@ -52,6 +58,8 @@ struct Gfx {
 
 thread_local! {
     static GFX: RefCell<Option<Gfx>> = const { RefCell::new(None) };
+    /// Annotation text formats by font size (f32 bits).
+    static TEXT_FORMATS: RefCell<Vec<(u32, IDWriteTextFormat)>> = const { RefCell::new(Vec::new()) };
 }
 
 fn stroke_style(f: &ID2D1Factory, round: bool) -> Result<ID2D1StrokeStyle> {
@@ -203,6 +211,146 @@ impl Fonts {
     }
 }
 
+/// Annotation text: Segoe UI Semibold, left-aligned, lines broken at '\n' only.
+fn annotation_format(g: &Gfx, size: f32) -> Result<IDWriteTextFormat> {
+    let key = size.to_bits();
+    if let Some(f) = TEXT_FORMATS.with(|c| c.borrow().iter().find(|(k, _)| *k == key).map(|(_, f)| f.clone())) {
+        return Ok(f);
+    }
+    let f = unsafe {
+        let f = g.dwrite.CreateTextFormat(
+            w!("Segoe UI"),
+            None,
+            DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            size.max(1.0),
+            w!(""),
+        )?;
+        f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+        f
+    };
+    TEXT_FORMATS.with(|c| c.borrow_mut().push((key, f.clone())));
+    Ok(f)
+}
+
+/// An annotation's text laid out at a font size in image pixels, relative to
+/// its top-left corner. Positions are UTF-16 offsets into the text.
+pub struct TextBox {
+    layout: IDWriteTextLayout,
+    utf16: Vec<u16>,
+}
+
+impl TextBox {
+    pub fn new(text: &str, size: f32) -> Result<TextBox> {
+        let g = gfx()?;
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        let layout = unsafe { g.dwrite.CreateTextLayout(&utf16, &annotation_format(&g, size)?, 100_000.0, 100_000.0)? };
+        Ok(TextBox { layout, utf16 })
+    }
+
+    /// Width (trailing spaces included, so the caret stays inside) and the
+    /// height of all lines; empty text still has one line.
+    pub fn extent(&self) -> (f32, f32) {
+        let mut m = DWRITE_TEXT_METRICS::default();
+        match unsafe { self.layout.GetMetrics(&mut m) } {
+            Ok(()) => (m.widthIncludingTrailingWhitespace, m.height),
+            Err(_) => (0.0, 0.0),
+        }
+    }
+
+    fn lines(&self) -> Vec<DWRITE_LINE_METRICS> {
+        let mut m = DWRITE_TEXT_METRICS::default();
+        unsafe {
+            if self.layout.GetMetrics(&mut m).is_err() {
+                return Vec::new();
+            }
+            let mut lines = vec![DWRITE_LINE_METRICS::default(); m.lineCount.max(1) as usize];
+            let mut n = 0;
+            if self.layout.GetLineMetrics(Some(&mut lines), &mut n).is_err() {
+                return Vec::new();
+            }
+            lines.truncate(n as usize);
+            lines
+        }
+    }
+
+    /// The caret before UTF-16 offset `pos`: x, top and height.
+    pub fn caret(&self, pos: usize) -> (f32, f32, f32) {
+        let pos = pos.min(self.utf16.len());
+        if pos == 0 || self.utf16[pos - 1] == '\n' as u16 {
+            // At a line start (also the empty line after a final newline,
+            // which has no character to hit-test): stack the line heights.
+            let line = self.utf16[..pos].iter().filter(|&&c| c == '\n' as u16).count();
+            let lines = self.lines();
+            let y = lines.iter().take(line).map(|l| l.height).sum();
+            let h = lines.get(line).or(lines.last()).map(|l| l.height).unwrap_or(0.0);
+            return (0.0, y, h);
+        }
+        let (mut x, mut y) = (0.0, 0.0);
+        let mut m = DWRITE_HIT_TEST_METRICS::default();
+        match unsafe { self.layout.HitTestTextPosition(pos as u32 - 1, true, &mut x, &mut y, &mut m) } {
+            Ok(()) => (x, m.top, m.height),
+            Err(_) => (0.0, 0.0, 0.0),
+        }
+    }
+
+    /// The UTF-16 offset nearest to (x, y).
+    pub fn hit(&self, x: f32, y: f32) -> usize {
+        let mut trailing = windows::core::BOOL(0);
+        let mut inside = windows::core::BOOL(0);
+        let mut m = DWRITE_HIT_TEST_METRICS::default();
+        if unsafe { self.layout.HitTestPoint(x, y, &mut trailing, &mut inside, &mut m) }.is_err() {
+            return self.utf16.len();
+        }
+        let mut pos = m.textPosition as usize;
+        if trailing.as_bool() {
+            pos += m.length as usize;
+            // Right of a line's end lands after its newline: stay on that line.
+            if pos > 0 && self.utf16.get(pos - 1) == Some(&('\n' as u16)) {
+                pos -= 1;
+            }
+        }
+        pos.min(self.utf16.len())
+    }
+}
+
+/// The pixelation mosaic uploaded to one render target.
+#[derive(Clone)]
+struct MosaicBitmap {
+    block: u32,
+    cols: u32,
+    rows: u32,
+    bitmap: ID2D1Bitmap,
+}
+
+impl MosaicBitmap {
+    fn new(rt: &ID2D1RenderTarget, m: &Mosaic) -> Result<MosaicBitmap> {
+        let props = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: pixel_format(D2D1_ALPHA_MODE_IGNORE),
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+        let bitmap = unsafe {
+            rt.CreateBitmap(
+                D2D_SIZE_U {
+                    width: m.cols,
+                    height: m.rows,
+                },
+                Some(m.bgra.as_ptr() as *const c_void),
+                m.cols * 4,
+                &props,
+            )?
+        };
+        Ok(MosaicBitmap {
+            block: m.block,
+            cols: m.cols,
+            rows: m.rows,
+            bitmap,
+        })
+    }
+}
+
 /// Uploads the capture as a bitmap; one larger than the GPU allows is shown
 /// downscaled (the export always uses the full-resolution pixels).
 fn upload(rt: &ID2D1RenderTarget, image: &Image) -> Result<ID2D1Bitmap> {
@@ -246,6 +394,8 @@ pub struct Target {
     /// The capture resampled once to the on-screen size (width, height, bitmap),
     /// so frames do not redo a full-resolution cubic downscale.
     scaled: RefCell<Option<(u32, u32, ID2D1Bitmap)>>,
+    /// The pixelation mosaic, uploaded the first time an area needs it.
+    mosaic: RefCell<Option<MosaicBitmap>>,
     brush: ID2D1SolidColorBrush,
     gfx: Gfx,
 }
@@ -280,6 +430,7 @@ impl Target {
                 dc,
                 bitmap,
                 scaled: RefCell::new(None),
+                mosaic: RefCell::new(None),
                 brush,
                 gfx,
             })
@@ -345,7 +496,18 @@ impl Target {
     }
 
     /// One frame. An error with `needs_recreate` means the device was lost.
-    pub fn draw(&self, f: impl FnOnce(&Canvas)) -> Result<()> {
+    /// `mosaic` is needed once pixelated areas exist.
+    pub fn draw(&self, mosaic: Option<&Mosaic>, f: impl FnOnce(&Canvas)) -> Result<()> {
+        if let Some(m) = mosaic {
+            let stale = !matches!(&*self.mosaic.borrow(), Some(b) if (b.block, b.cols, b.rows) == (m.block, m.cols, m.rows));
+            if stale {
+                let made = MosaicBitmap::new(&self.rt, m);
+                if let Err(e) = &made {
+                    log(&format!("editor: mosaic bitmap failed: {e}"));
+                }
+                *self.mosaic.borrow_mut() = made.ok();
+            }
+        }
         unsafe {
             self.rt.BeginDraw();
             self.rt.SetTransform(&Matrix3x2::identity());
@@ -357,6 +519,7 @@ impl Target {
                 dc: self.dc.as_ref(),
                 bitmap: Some(&self.bitmap),
                 scaled,
+                mosaic: self.mosaic.borrow().clone(),
                 brush: &self.brush,
                 gfx: &self.gfx,
             };
@@ -373,6 +536,7 @@ pub struct Canvas<'a> {
     bitmap: Option<&'a ID2D1Bitmap>,
     /// Pre-resampled copy of `bitmap` (see Target::prepare_view).
     scaled: Option<(u32, u32, ID2D1Bitmap)>,
+    mosaic: Option<MosaicBitmap>,
     brush: &'a ID2D1SolidColorBrush,
     gfx: &'a Gfx,
 }
@@ -393,6 +557,40 @@ fn triangle(f: &ID2D1Factory, a: Pt, b: Pt, c: Pt) -> Result<ID2D1PathGeometry> 
         sink.AddLine(v2(b));
         sink.AddLine(v2(c));
         sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+        sink.Close()?;
+        Ok(geom)
+    }
+}
+
+fn mid(p: Pt, q: Pt) -> Pt {
+    Pt::new((p.x + q.x) * 0.5, (p.y + q.y) * 0.5)
+}
+
+/// A freehand stroke (3 points or more) whose corners are rounded by
+/// quadratic curves between the midpoints of their segments, the point being
+/// the control point. Corners the curve would cut by more than `max_cut` keep
+/// their point, so hairpins and sharp turns stay where they were drawn.
+fn smooth_path(f: &ID2D1Factory, pts: &[Pt], max_cut: f32) -> Result<ID2D1PathGeometry> {
+    unsafe {
+        let geom = f.CreatePathGeometry()?;
+        let sink = geom.Open()?;
+        let n = pts.len();
+        sink.BeginFigure(v2(pts[0]), D2D1_FIGURE_BEGIN_HOLLOW);
+        sink.AddLine(v2(mid(pts[0], pts[1])));
+        for i in 1..n - 1 {
+            let next = mid(pts[i], pts[i + 1]);
+            if corner_cut(pts[i - 1], pts[i], pts[i + 1]) > max_cut {
+                sink.AddLine(v2(pts[i]));
+                sink.AddLine(v2(next));
+            } else {
+                sink.AddQuadraticBezier(&D2D1_QUADRATIC_BEZIER_SEGMENT {
+                    point1: v2(pts[i]),
+                    point2: v2(next),
+                });
+            }
+        }
+        sink.AddLine(v2(pts[n - 1]));
+        sink.EndFigure(D2D1_FIGURE_END_OPEN);
         sink.Close()?;
         Ok(geom)
     }
@@ -457,6 +655,47 @@ impl Canvas<'_> {
         match triangle(&self.gfx.factory, p0, p1, p2) {
             Ok(g) => unsafe { self.rt.FillGeometry(&g, self.paint(rgb, a), None) },
             Err(e) => log(&format!("editor: arrowhead geometry failed: {e}")),
+        }
+    }
+
+    /// A smoothed freehand stroke with round caps, drawn as one geometry so a
+    /// translucent stroke crossing itself does not get darker there.
+    pub fn stroke_points(&self, pts: &[Pt], rgb: u32, a: f32, width: f32) {
+        match pts {
+            [] => {}
+            [p] => self.fill_circle(*p, width * 0.5, rgb, a),
+            [p, q] => self.line(*p, *q, rgb, a, width),
+            _ => match smooth_path(&self.gfx.factory, pts, (width * 0.5).max(1.0)) {
+                Ok(g) => unsafe { self.rt.DrawGeometry(&g, self.paint(rgb, a), width, &self.gfx.round) },
+                Err(e) => log(&format!("editor: stroke geometry failed: {e}")),
+            },
+        }
+    }
+
+    /// A pixelated area: the capture's mosaic, clipped to the area. Without
+    /// the mosaic the area is filled grey, never left showing what it hides.
+    fn pixelate(&self, r: RectF, block: f32) {
+        match &self.mosaic {
+            Some(m) if m.block as f32 == block => {
+                let all = RectF {
+                    l: 0.0,
+                    t: 0.0,
+                    r: (m.cols * m.block) as f32,
+                    b: (m.rows * m.block) as f32,
+                };
+                self.push_clip(r);
+                unsafe {
+                    self.rt.DrawBitmap(
+                        &m.bitmap,
+                        Some(&all.d2d()),
+                        1.0,
+                        D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                        None,
+                    )
+                };
+                self.pop_clip();
+            }
+            _ => self.fill_rect(r, 0x808080, 1.0),
         }
     }
 
@@ -581,15 +820,47 @@ impl Canvas<'_> {
                 let c = Pt::new((lo.x + hi.x) * 0.5, (lo.y + hi.y) * 0.5);
                 self.stroke_ellipse(c, (hi.x - lo.x) * 0.5, (hi.y - lo.y) * 0.5, rgb, 1.0, w);
             }
+            Kind::Pen => self.stroke_points(&s.points, rgb, 1.0, w),
+            Kind::Highlighter => self.stroke_points(&s.points, rgb, HIGHLIGHTER_ALPHA, w),
+            Kind::Text => match TextBox::new(&s.text, w) {
+                Ok(t) => unsafe {
+                    self.rt
+                        .DrawTextLayout(v2(s.a), &t.layout, self.paint(rgb, 1.0), D2D1_DRAW_TEXT_OPTIONS_NONE)
+                },
+                Err(e) => log(&format!("editor: text layout failed: {e}")),
+            },
+            Kind::Pixelate => {
+                let (lo, hi) = s.bounds();
+                self.pixelate(
+                    RectF {
+                        l: lo.x,
+                        t: lo.y,
+                        r: hi.x,
+                        b: hi.y,
+                    },
+                    w,
+                );
+            }
         }
     }
 }
 
 /// Draws `shapes` into a copy of `image` at full resolution (software
 /// rasterizer: no size limit, same anti-aliasing as the editor shows).
-pub fn render_export(image: &Image, shapes: &[Shape]) -> std::result::Result<Image, String> {
+/// `mosaic` is the one the editor showed; it is made here if missing.
+pub fn render_export(image: &Image, shapes: &[Shape], mosaic: Option<&Mosaic>) -> std::result::Result<Image, String> {
     let g = gfx().map_err(|e| format!("Direct2D unavailable: {e}"))?;
     let (w, h) = (image.width as i32, image.height as i32);
+    let block = shapes.iter().find(|s| s.kind == Kind::Pixelate).map(|s| s.style.width as u32);
+    let made;
+    let mosaic = match (mosaic, block) {
+        (Some(m), Some(b)) if m.block == b => Some(m),
+        (_, Some(b)) => {
+            made = Mosaic::new(&image.bgra, image.width as usize, image.height as usize, b);
+            Some(&made)
+        }
+        (_, None) => None,
+    };
     let mut dib = DibSection::new(w, h).map_err(|e| format!("cannot allocate {w}x{h}: {e}"))?;
     if dib.len() != image.bgra.len() {
         return Err(format!("image buffer size mismatch for {w}x{h}"));
@@ -602,13 +873,20 @@ pub fn render_export(image: &Image, shapes: &[Shape]) -> std::result::Result<Ima
             let rt: ID2D1DCRenderTarget = g.factory.CreateDCRenderTarget(&target_props(D2D1_RENDER_TARGET_TYPE_SOFTWARE))?;
             rt.BindDC(mem.0, &RECT { left: 0, top: 0, right: w, bottom: h })?;
             let brush = rt.CreateSolidColorBrush(&color(0, 1.0), None)?;
+            let mosaic = match mosaic {
+                Some(m) => Some(MosaicBitmap::new(&rt, m)?),
+                None => None,
+            };
             rt.BeginDraw();
             rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            // Grayscale like the window: ClearType would leave colour fringes in the file.
+            rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             let c = Canvas {
                 rt: &rt,
                 dc: None,
                 bitmap: None,
                 scaled: None,
+                mosaic,
                 brush: &brush,
                 gfx: &g,
             };

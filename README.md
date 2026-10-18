@@ -42,17 +42,22 @@ or installer is needed.
 ## Annotating
 
 Clicking a thumbnail opens the capture in an editor, like Markup on macOS. Drag on
-the image to draw a line, an arrow, a rectangle or an ellipse with the chosen width
-and colour. Click a shape to select it, then drag it or its handles, or pick another
-width or colour to restyle it. **Done** writes the annotations into the PNG (the
-file is replaced) and slides a new thumbnail in, ready to be dragged; **Cancel**
-leaves the file as it was. The last tool, width and colour are remembered.
+the image to draw a line, an arrow, a rectangle, an ellipse, a pen or highlighter
+stroke with the chosen width and colour, or to pixelate an area (12 px blocks) and
+hide what is under it. With the text tool, click and type; the width presets give
+four text sizes, and a double-click on text edits it again. Click a shape to select
+it, then drag it or its handles, or pick another width or colour to restyle it.
+**Done** writes the annotations into the PNG (the file is replaced) and slides a new
+thumbnail in, ready to be dragged; **Cancel** leaves the file as it was. The last
+tool, width and colour are remembered.
 
 | Action | Key |
 |---|---|
 | Line, arrow, rectangle, ellipse | `L`, `A`, `R`, `E` |
+| Pen, highlighter, text, pixelate | `P`, `H`, `T`, `B` |
 | Width presets | `1` to `4` |
-| 45° lines, squares and circles, straight moves | hold `Shift` |
+| 45° lines, squares and circles, straight strokes and moves | hold `Shift` |
+| Finish typing | `Esc` or click elsewhere (`Enter` starts a new line) |
 | Undo, redo | `Ctrl+Z`, `Ctrl+Y` (or `Ctrl+Shift+Z`) |
 | Delete the selected shape | `Delete` or `Backspace` |
 | Nudge the selected shape | arrow keys (`Shift` for 10 px) |

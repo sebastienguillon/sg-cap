@@ -13,10 +13,11 @@ use windows::Win32::System::Com::{
     STGMEDIUM_0, TYMED_HGLOBAL,
 };
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
 };
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-use windows::Win32::System::Ole::{IDropSource, CF_DIB, CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK};
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Ole::{IDropSource, CF_DIB, CF_HDROP, CF_UNICODETEXT, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     IDragSourceHelper, ILClone, ILCreateFromPathW, ILFindLastID, ILFree, ILRemoveLastID, SHCreateDataObject,
@@ -209,5 +210,29 @@ pub fn copy_to_clipboard(hwnd: HWND, image: &Image, png: Option<&[u8]>) -> windo
         })();
         let _ = CloseClipboard();
         result
+    }
+}
+
+/// The clipboard's text, if it holds any (lines end with '\n').
+pub fn clipboard_text(hwnd: HWND) -> Option<String> {
+    unsafe {
+        IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32).ok()?;
+        OpenClipboard(Some(hwnd)).ok()?;
+        let text = (|| {
+            let h = GetClipboardData(CF_UNICODETEXT.0 as u32).ok()?;
+            let hg = HGLOBAL(h.0);
+            let p = GlobalLock(hg) as *const u16;
+            if p.is_null() {
+                return None;
+            }
+            // Up to the terminating NUL, never past the block.
+            let max = GlobalSize(hg) / 2;
+            let n = (0..max).find(|&i| *p.add(i) == 0).unwrap_or(max);
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+            let _ = GlobalUnlock(hg);
+            Some(s)
+        })();
+        let _ = CloseClipboard();
+        text.map(|s| s.replace("\r\n", "\n").replace('\r', "\n"))
     }
 }

@@ -1,6 +1,9 @@
 //! Annotation model: vector shapes in image pixel coordinates, hit testing,
-//! selection handles, Shift constraints and a snapshot-based undo history.
-//! Pure Rust, no Win32: the editor window and the renderer build on it.
+//! selection handles, Shift constraints, the pixelation mosaic and a
+//! snapshot-based undo history. Pure Rust, no Win32: the editor window and
+//! the renderer build on it.
+
+use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -8,10 +11,23 @@ pub enum Kind {
     Arrow,
     Rect,
     Ellipse,
+    Pen,
+    Highlighter,
+    Text,
+    Pixelate,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::Line, Kind::Arrow, Kind::Rect, Kind::Ellipse];
+    pub const ALL: [Kind; 8] = [
+        Kind::Line,
+        Kind::Arrow,
+        Kind::Rect,
+        Kind::Ellipse,
+        Kind::Pen,
+        Kind::Highlighter,
+        Kind::Text,
+        Kind::Pixelate,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -19,6 +35,10 @@ impl Kind {
             Kind::Arrow => "arrow",
             Kind::Rect => "rect",
             Kind::Ellipse => "ellipse",
+            Kind::Pen => "pen",
+            Kind::Highlighter => "highlighter",
+            Kind::Text => "text",
+            Kind::Pixelate => "pixelate",
         }
     }
 
@@ -29,6 +49,16 @@ impl Kind {
     /// Line-like shapes have two endpoint handles; the others a bounding box.
     pub fn is_linear(self) -> bool {
         matches!(self, Kind::Line | Kind::Arrow)
+    }
+
+    /// Strokes drawn by hand: a list of points, moved but never reshaped.
+    pub fn is_freehand(self) -> bool {
+        matches!(self, Kind::Pen | Kind::Highlighter)
+    }
+
+    /// Boxes resized by eight handles.
+    pub fn is_box(self) -> bool {
+        matches!(self, Kind::Rect | Kind::Ellipse | Kind::Pixelate)
     }
 }
 
@@ -72,7 +102,8 @@ impl Pt {
 pub struct Style {
     /// 0xRRGGBB.
     pub color: u32,
-    /// Stroke width in image pixels.
+    /// Stroke width in image pixels; the font size for text and the block
+    /// size for pixelated areas.
     pub width: f32,
 }
 
@@ -105,14 +136,22 @@ impl Handle {
     ];
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Shape {
     pub kind: Kind,
-    /// Start point (lines) or one corner (boxes).
+    /// Start point (lines), one corner (boxes), the top-left corner (text,
+    /// freehand strokes).
     pub a: Pt,
-    /// End point, where the arrowhead sits (lines), or the opposite corner (boxes).
+    /// End point, where the arrowhead sits (lines), the opposite corner
+    /// (boxes), the bottom-right corner (text as laid out, which the editor
+    /// measures; the points' bounds for freehand strokes).
     pub b: Pt,
     pub style: Style,
+    /// Freehand strokes: the points as drawn. Shared, so that undo snapshots
+    /// do not copy them.
+    pub points: Arc<Vec<Pt>>,
+    /// Text: the characters, lines separated by '\n'.
+    pub text: String,
 }
 
 /// Arrowhead triangle plus the point where the shaft stops: far enough inside
@@ -269,7 +308,169 @@ fn dist_to_ellipse_outline(p: Pt, lo: Pt, hi: Pt) -> f32 {
     ((px - rx * tx).powi(2) + (py - ry * ty).powi(2)).sqrt() as f32
 }
 
+/// Distance from `p` to the polyline through `pts`.
+fn dist_to_polyline(p: Pt, pts: &[Pt]) -> f32 {
+    match pts {
+        [] => f32::INFINITY,
+        [q] => p.dist(*q),
+        _ => pts
+            .windows(2)
+            .map(|s| dist_to_segment(p, s[0], s[1]))
+            .fold(f32::INFINITY, f32::min),
+    }
+}
+
+/// Distance from `p` to the axis-aligned box [lo, hi] (0 inside).
+fn dist_to_box(p: Pt, lo: Pt, hi: Pt) -> f32 {
+    let dx = (lo.x - p.x).max(0.0).max(p.x - hi.x);
+    let dy = (lo.y - p.y).max(0.0).max(p.y - hi.y);
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// How far a quadratic curve from the middle of a-p to the middle of p-b,
+/// with p as its control point, passes from the corner p: a quarter of the
+/// way back along both segments, |(b - p) - (p - a)| / 8.
+pub fn corner_cut(a: Pt, p: Pt, b: Pt) -> f32 {
+    b.sub(p).sub(p.sub(a)).len() / 8.0
+}
+
+/// Drops the points that stray less than `tol` from the line through their
+/// neighbours (Ramer-Douglas-Peucker); the first and last points stay.
+pub fn simplify_points(pts: &[Pt], tol: f32) -> Vec<Pt> {
+    if pts.len() < 3 {
+        return pts.to_vec();
+    }
+    let mut keep = vec![false; pts.len()];
+    keep[0] = true;
+    keep[pts.len() - 1] = true;
+    let mut todo = vec![(0, pts.len() - 1)];
+    while let Some((i, j)) = todo.pop() {
+        let far = (i + 1..j)
+            .map(|k| (dist_to_segment(pts[k], pts[i], pts[j]), k))
+            .max_by(|x, y| x.0.total_cmp(&y.0));
+        if let Some((d, k)) = far {
+            if d > tol {
+                keep[k] = true;
+                todo.push((i, k));
+                todo.push((k, j));
+            }
+        }
+    }
+    pts.iter().zip(keep).filter(|(_, k)| *k).map(|(p, _)| *p).collect()
+}
+
+/// The capture averaged over square blocks: how pixelated areas look. Blocks
+/// are aligned on the image's top-left corner, so an area shows the same
+/// mosaic wherever it is moved, and the window matches the saved file. Only
+/// the capture is averaged, never the annotations drawn under an area.
+#[derive(Debug, PartialEq)]
+pub struct Mosaic {
+    pub block: u32,
+    pub cols: u32,
+    pub rows: u32,
+    /// cols x rows BGRA pixels, alpha 255.
+    pub bgra: Vec<u8>,
+}
+
+impl Mosaic {
+    /// `bgra`: w x h top-down BGRA pixels. Blocks cut by the right or bottom
+    /// edge average the pixels they cover.
+    pub fn new(bgra: &[u8], w: usize, h: usize, block: u32) -> Mosaic {
+        let b = block.max(1) as usize;
+        let h = if w == 0 { 0 } else { h.min(bgra.len() / (w * 4)) };
+        let cols = w.div_ceil(b).max(1);
+        let rows = h.div_ceil(b).max(1);
+        let mut out = vec![0u8; cols * rows * 4];
+        let mut sums = vec![[0u64; 3]; cols];
+        for by in 0..rows {
+            sums.fill([0; 3]);
+            let (y0, y1) = (by * b, ((by + 1) * b).min(h));
+            for y in y0..y1 {
+                let row = &bgra[y * w * 4..(y + 1) * w * 4];
+                for (bx, sum) in sums.iter_mut().enumerate() {
+                    let (x0, x1) = (bx * b, ((bx + 1) * b).min(w));
+                    for px in row[x0 * 4..x1 * 4].chunks_exact(4) {
+                        sum[0] += px[0] as u64;
+                        sum[1] += px[1] as u64;
+                        sum[2] += px[2] as u64;
+                    }
+                }
+            }
+            for (bx, sum) in sums.iter().enumerate() {
+                let n = (((bx + 1) * b).min(w).saturating_sub(bx * b) * y1.saturating_sub(y0)) as u64;
+                let o = &mut out[(by * cols + bx) * 4..][..4];
+                if n > 0 {
+                    for c in 0..3 {
+                        o[c] = ((sum[c] + n / 2) / n) as u8;
+                    }
+                }
+                o[3] = 255;
+            }
+        }
+        Mosaic {
+            block: b as u32,
+            cols: cols as u32,
+            rows: rows as u32,
+            bgra: out,
+        }
+    }
+}
+
 impl Shape {
+    /// A shape from a to b; a freehand stroke starts as the single point a.
+    pub fn new(kind: Kind, a: Pt, b: Pt, style: Style) -> Shape {
+        let freehand = kind.is_freehand();
+        Shape {
+            kind,
+            a,
+            b: if freehand { a } else { b },
+            style,
+            points: Arc::new(if freehand { vec![a] } else { Vec::new() }),
+            text: String::new(),
+        }
+    }
+
+    /// Text with nothing visible in it.
+    pub fn is_empty_text(&self) -> bool {
+        self.kind == Kind::Text && self.text.trim().is_empty()
+    }
+
+    /// Adds a point to a freehand stroke being drawn, unless it is within
+    /// `min_step` of the last one. `constrain` (Shift) turns the stroke into a
+    /// straight line from its first point, at a multiple of 45 degrees.
+    pub fn extend(&mut self, p: Pt, constrain: bool, min_step: f32) {
+        let pts = Arc::make_mut(&mut self.points);
+        let first = pts.first().copied().unwrap_or(p);
+        if constrain {
+            *pts = vec![first, snap_45(first, p)];
+        } else if pts.last().is_none_or(|q| q.dist(p) >= min_step) {
+            pts.push(p);
+        }
+        self.fit_points();
+    }
+
+    /// Thins a freehand stroke out to the points that matter (see simplify_points).
+    pub fn simplify(&mut self, tol: f32) {
+        if self.points.len() > 2 {
+            self.points = Arc::new(simplify_points(&self.points, tol));
+            self.fit_points();
+        }
+    }
+
+    /// a/b become the bounds of a freehand stroke's points.
+    fn fit_points(&mut self) {
+        let Some(&first) = self.points.first() else {
+            return;
+        };
+        let (mut lo, mut hi) = (first, first);
+        for p in self.points.iter() {
+            lo = Pt::new(lo.x.min(p.x), lo.y.min(p.y));
+            hi = Pt::new(hi.x.max(p.x), hi.y.max(p.y));
+        }
+        self.a = lo;
+        self.b = hi;
+    }
+
     /// Normalised bounds of the two defining points (top-left, bottom-right).
     pub fn bounds(&self) -> (Pt, Pt) {
         (
@@ -288,13 +489,18 @@ impl Shape {
         }
     }
 
-    /// Too small to be worth keeping (a click rather than a drag).
+    /// Too small to be worth keeping (a click rather than a drag), or text
+    /// with nothing to show.
     pub fn is_degenerate(&self, min_len: f32) -> bool {
-        if self.kind.is_linear() {
-            self.a.dist(self.b) < min_len
-        } else {
-            let (lo, hi) = self.bounds();
-            hi.x - lo.x < min_len && hi.y - lo.y < min_len
+        let (lo, hi) = self.bounds();
+        match self.kind {
+            Kind::Line | Kind::Arrow => self.a.dist(self.b) < min_len,
+            Kind::Text => self.is_empty_text(),
+            // A pixelated sliver hides nothing.
+            Kind::Pixelate => hi.x - lo.x < min_len || hi.y - lo.y < min_len,
+            Kind::Rect | Kind::Ellipse | Kind::Pen | Kind::Highlighter => {
+                hi.x - lo.x < min_len && hi.y - lo.y < min_len
+            }
         }
     }
 
@@ -303,7 +509,9 @@ impl Shape {
     /// rectangles and straight lines come out crisp instead of half-covered.
     /// The two grids are half a pixel apart and ties go opposite ways
     /// (k -> k+0.5 for odd, k+0.5 -> k for even), so switching widths back
-    /// and forth does not walk the shape across the image.
+    /// and forth does not walk the shape across the image. Pixelated areas
+    /// get whole-pixel edges and text a whole-pixel origin; freehand strokes
+    /// are left as drawn.
     pub fn snap_to_pixels(&mut self) {
         self.style.width = self.style.width.round().max(1.0);
         let odd = self.style.width as i32 % 2 == 1;
@@ -328,7 +536,16 @@ impl Shape {
                     self.b.x = x;
                 }
             }
-            Kind::Ellipse => {}
+            Kind::Pixelate => {
+                self.a = Pt::new(self.a.x.round(), self.a.y.round());
+                self.b = Pt::new(self.b.x.round(), self.b.y.round());
+            }
+            Kind::Text => {
+                let d = Pt::new(self.a.x.round() - self.a.x, self.a.y.round() - self.a.y);
+                self.a = self.a.add(d);
+                self.b = self.b.add(d);
+            }
+            Kind::Ellipse | Kind::Pen | Kind::Highlighter => {}
         }
     }
 
@@ -373,12 +590,19 @@ impl Shape {
                     .all(|&p| within(p, rx, ry) && dist_to_ellipse_outline(p, lo, hi) > pad);
                 reaches && !in_hole
             }
+            Kind::Pen | Kind::Highlighter => match self.points.as_slice() {
+                [] => false,
+                [p] => segment_touches_rect(*p, *p, pad, w, h),
+                pts => pts.windows(2).any(|s| segment_touches_rect(s[0], s[1], pad, w, h)),
+            },
+            Kind::Text | Kind::Pixelate => lo.x < w && hi.x > 0.0 && lo.y < h && hi.y > 0.0,
         }
     }
 
     /// Does `p` touch the drawn stroke? `tol` is extra slack in image pixels.
     /// Rectangles and ellipses are outlines: their inside does not count, so
-    /// new shapes can still be drawn within them.
+    /// new shapes can still be drawn within them. Text and pixelated areas
+    /// count everywhere inside.
     pub fn hit(&self, p: Pt, tol: f32) -> bool {
         let reach = self.style.width * 0.5 + tol;
         match self.kind {
@@ -405,12 +629,26 @@ impl Shape {
                 let (lo, hi) = self.bounds();
                 dist_to_ellipse_outline(p, lo, hi) <= reach
             }
+            Kind::Pen | Kind::Highlighter => {
+                let (lo, hi) = self.bounds();
+                // Cheap rejection first: strokes can have thousands of points.
+                dist_to_box(p, lo, hi) <= reach && dist_to_polyline(p, &self.points) <= reach
+            }
+            Kind::Text | Kind::Pixelate => {
+                let (lo, hi) = self.bounds();
+                dist_to_box(p, lo, hi) <= tol
+            }
         }
     }
 
+    /// Selection handles: endpoints for lines, eight for boxes, none for
+    /// text and freehand strokes (moved only).
     pub fn handles(&self) -> Vec<(Handle, Pt)> {
         if self.kind.is_linear() {
             return vec![(Handle::A, self.a), (Handle::B, self.b)];
+        }
+        if !self.kind.is_box() {
+            return Vec::new();
         }
         let (lo, hi) = self.bounds();
         let mx = (lo.x + hi.x) * 0.5;
@@ -447,6 +685,11 @@ impl Shape {
     pub fn translate(&mut self, d: Pt) {
         self.a = self.a.add(d);
         self.b = self.b.add(d);
+        if !self.points.is_empty() {
+            for q in Arc::make_mut(&mut self.points) {
+                *q = q.add(d);
+            }
+        }
     }
 
     /// Moves handle `h` to `p`. Boxes must have been normalised when the drag
@@ -587,12 +830,21 @@ mod tests {
     };
 
     fn shape(kind: Kind, a: (f32, f32), b: (f32, f32)) -> Shape {
-        Shape {
-            kind,
-            a: Pt::new(a.0, a.1),
-            b: Pt::new(b.0, b.1),
-            style: RED,
+        Shape::new(kind, Pt::new(a.0, a.1), Pt::new(b.0, b.1), RED)
+    }
+
+    fn stroke(kind: Kind, pts: &[(f32, f32)]) -> Shape {
+        let mut s = shape(kind, pts[0], pts[0]);
+        for &(x, y) in &pts[1..] {
+            s.extend(Pt::new(x, y), false, 0.0);
         }
+        s
+    }
+
+    fn text(at: (f32, f32), size: (f32, f32), s: &str) -> Shape {
+        let mut t = shape(Kind::Text, at, (at.0 + size.0, at.1 + size.1));
+        t.text = s.to_string();
+        t
     }
 
     fn close(p: Pt, x: f32, y: f32) -> bool {
@@ -916,6 +1168,182 @@ mod tests {
         d.shapes.clear();
         assert!(d.commit(before));
         assert!(!d.can_redo());
+    }
+
+    #[test]
+    fn freehand_stroke_follows_its_points() {
+        let mut s = shape(Kind::Pen, (10.0, 10.0), (99.0, 99.0));
+        assert_eq!(s.points.len(), 1, "starts as the press point");
+        assert!(close(s.b, 10.0, 10.0));
+        s.extend(Pt::new(10.5, 10.0), false, 2.0);
+        assert_eq!(s.points.len(), 1, "too close to the last point");
+        s.extend(Pt::new(50.0, 10.0), false, 2.0);
+        s.extend(Pt::new(50.0, 60.0), false, 2.0);
+        assert_eq!(s.points.len(), 3);
+        let (lo, hi) = s.bounds();
+        assert!(close(lo, 10.0, 10.0) && close(hi, 50.0, 60.0), "a/b are the points' bounds");
+        // Hit along the drawn segments only, not across the corner.
+        assert!(s.hit(Pt::new(30.0, 11.0), 0.0));
+        assert!(s.hit(Pt::new(51.5, 40.0), 0.0));
+        assert!(!s.hit(Pt::new(30.0, 40.0), 3.0));
+        assert!(!s.hit(Pt::new(200.0, 10.0), 3.0));
+        assert!(s.handles().is_empty(), "moved, never reshaped");
+        assert_eq!(s.handle_at(Pt::new(10.0, 10.0), 5.0), None);
+    }
+
+    #[test]
+    fn shift_straightens_a_freehand_stroke() {
+        let mut s = stroke(Kind::Highlighter, &[(0.0, 0.0), (20.0, 5.0), (40.0, -3.0)]);
+        s.extend(Pt::new(100.0, 4.0), true, 0.0);
+        assert_eq!(s.points.len(), 2);
+        assert!(close(s.points[0], 0.0, 0.0) && close(s.points[1], 100.0, 0.0));
+        // Releasing Shift carries on from the straight end.
+        s.extend(Pt::new(120.0, 20.0), false, 0.0);
+        assert_eq!(s.points.len(), 3);
+    }
+
+    #[test]
+    fn moving_a_stroke_moves_its_points_not_the_undo_copy() {
+        let mut d = Doc::default();
+        d.shapes.push(stroke(Kind::Pen, &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)]));
+        let before = d.shapes.clone();
+        d.shapes[0].translate(Pt::new(5.0, 7.0));
+        assert!(close(d.shapes[0].points[2], 15.0, 17.0));
+        assert!(close(d.shapes[0].a, 5.0, 7.0) && close(d.shapes[0].b, 15.0, 17.0));
+        assert!(close(before[0].points[2], 10.0, 10.0), "the snapshot keeps its own points");
+        assert!(d.commit(before));
+        assert!(d.undo());
+        assert!(close(d.shapes[0].points[2], 10.0, 10.0));
+    }
+
+    #[test]
+    fn freehand_touches_image_and_degenerates() {
+        let on = |s: &Shape| s.touches_image(100.0, 100.0);
+        assert!(on(&stroke(Kind::Pen, &[(-50.0, 50.0), (-10.0, 50.0), (20.0, 50.0)])));
+        assert!(!on(&stroke(Kind::Pen, &[(-50.0, 50.0), (-10.0, 50.0), (-10.0, 90.0)])));
+        let mut wide = stroke(Kind::Highlighter, &[(-50.0, 50.0), (-8.0, 50.0)]);
+        wide.style.width = 24.0;
+        assert!(on(&wide), "a wide stroke reaches in with its half width");
+        assert!(stroke(Kind::Pen, &[(5.0, 5.0), (6.0, 6.0)]).is_degenerate(3.0));
+        assert!(!stroke(Kind::Pen, &[(5.0, 5.0), (25.0, 6.0)]).is_degenerate(3.0));
+    }
+
+    #[test]
+    fn simplify_keeps_corners_and_drops_collinear_points() {
+        let pts: Vec<Pt> = (0..=10)
+            .map(|i| Pt::new(i as f32 * 10.0, 0.0))
+            .chain((1..=10).map(|i| Pt::new(100.0, i as f32 * 10.0)))
+            .collect();
+        let out = simplify_points(&pts, 0.5);
+        assert_eq!(out, vec![Pt::new(0.0, 0.0), Pt::new(100.0, 0.0), Pt::new(100.0, 100.0)]);
+        // Wobbles bigger than the tolerance stay.
+        let wobbly = [Pt::new(0.0, 0.0), Pt::new(5.0, 2.0), Pt::new(10.0, 0.0)];
+        assert_eq!(simplify_points(&wobbly, 0.5).len(), 3);
+        assert_eq!(simplify_points(&wobbly, 3.0).len(), 2);
+        let mut s = stroke(Kind::Pen, &[(0.0, 0.0), (5.0, 0.01), (10.0, 0.0)]);
+        s.simplify(0.5);
+        assert_eq!(s.points.len(), 2);
+    }
+
+    #[test]
+    fn corner_cut_measures_how_much_smoothing_shortcuts_a_corner() {
+        // Straight on: no cut. A hairpin drawn out to x = 300 and back.
+        assert_eq!(corner_cut(Pt::new(0.0, 0.0), Pt::new(5.0, 0.0), Pt::new(10.0, 0.0)), 0.0);
+        let hairpin = corner_cut(Pt::new(40.0, 0.0), Pt::new(300.0, 0.0), Pt::new(150.0, 0.0));
+        assert!((hairpin - 51.25).abs() < 1e-3, "{hairpin}");
+        // Dense samples on a circle of radius 100 (3 px apart): far under a pixel.
+        let at = |deg: f32| Pt::new(100.0 * deg.to_radians().cos(), 100.0 * deg.to_radians().sin());
+        assert!(corner_cut(at(0.0), at(1.7), at(3.4)) < 0.02);
+        // The quadratic's midpoint is that far from the corner.
+        let (a, p, b) = (Pt::new(0.0, 0.0), Pt::new(10.0, 0.0), Pt::new(10.0, 10.0));
+        let (m1, m2) = (Pt::new(5.0, 0.0), Pt::new(10.0, 5.0));
+        let half = m1.mul(0.25).add(p.mul(0.5)).add(m2.mul(0.25));
+        assert!((half.dist(p) - corner_cut(a, p, b)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn pixelated_area_is_a_filled_box() {
+        let mut p = shape(Kind::Pixelate, (80.4, 60.6), (20.2, 10.5));
+        p.style.width = 12.0;
+        p.normalize();
+        p.snap_to_pixels();
+        assert!(close(p.a, 20.0, 11.0) && close(p.b, 80.0, 61.0), "{p:?}");
+        assert!(p.hit(Pt::new(50.0, 30.0), 0.0), "inside counts");
+        assert!(p.hit(Pt::new(82.0, 30.0), 3.0));
+        assert!(!p.hit(Pt::new(90.0, 30.0), 3.0));
+        assert_eq!(p.handles().len(), 8);
+        assert_eq!(p.handle_at(Pt::new(80.0, 36.0), 4.0), Some(Handle::E));
+        assert!(p.touches_image(100.0, 100.0));
+        assert!(!shape(Kind::Pixelate, (100.0, 0.0), (150.0, 50.0)).touches_image(100.0, 100.0), "only touching the edge");
+        assert!(shape(Kind::Pixelate, (0.0, 0.0), (50.0, 1.5)).is_degenerate(2.0), "a sliver hides nothing");
+        assert!(!shape(Kind::Pixelate, (0.0, 0.0), (50.0, 2.5)).is_degenerate(2.0));
+    }
+
+    #[test]
+    fn text_is_a_filled_box_without_handles() {
+        let mut t = text((10.3, 20.6), (60.0, 27.0), "Hello");
+        t.snap_to_pixels();
+        assert!(close(t.a, 10.0, 21.0) && close(t.b, 70.0, 48.0), "origin on a pixel, size kept: {t:?}");
+        assert!(t.hit(Pt::new(40.0, 30.0), 0.0));
+        assert!(t.hit(Pt::new(72.0, 30.0), 3.0));
+        assert!(!t.hit(Pt::new(40.0, 55.0), 3.0));
+        assert!(t.handles().is_empty());
+        assert!(!t.is_degenerate(3.0));
+        assert!(text((0.0, 0.0), (10.0, 27.0), " \n ").is_degenerate(0.0), "blank text is dropped");
+        assert!(text((0.0, 0.0), (10.0, 27.0), "").is_empty_text());
+        assert!(!text((-80.0, 0.0), (60.0, 27.0), "x").touches_image(100.0, 100.0));
+        assert!(text((-50.0, 0.0), (60.0, 27.0), "x").touches_image(100.0, 100.0));
+        let mut d = Doc::default();
+        d.shapes.push(text((0.0, 0.0), (60.0, 27.0), "Hi"));
+        assert_eq!(d.shape_at(Pt::new(30.0, 13.0), 2.0), Some(0));
+    }
+
+    fn image(w: usize, h: usize, f: impl Fn(usize, usize) -> [u8; 3]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let [b, g, r] = f(x, y);
+                v.extend_from_slice(&[b, g, r, 255]);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn mosaic_averages_aligned_blocks() {
+        // 5 x 3 image, 2 px blocks: 3 x 2 blocks, the last column and row partial.
+        let px = image(5, 3, |x, y| [(x * 10) as u8, (y * 20) as u8, 7]);
+        let m = Mosaic::new(&px, 5, 3, 2);
+        assert_eq!((m.block, m.cols, m.rows), (2, 3, 2));
+        let at = |c: usize, r: usize| &m.bgra[(r * 3 + c) * 4..][..4];
+        assert_eq!(at(0, 0), &[5, 10, 7, 255]); // x 0,10 / y 0,20
+        assert_eq!(at(1, 0), &[25, 10, 7, 255]); // x 20,30
+        assert_eq!(at(2, 0), &[40, 10, 7, 255]); // partial: x 40 only
+        assert_eq!(at(0, 1), &[5, 40, 7, 255]); // partial: y 40 only
+        assert_eq!(at(2, 1), &[40, 40, 7, 255]);
+    }
+
+    #[test]
+    fn mosaic_rounds_and_hides_detail() {
+        // Black text-like stripes on white, 12 px blocks: every block is one grey.
+        let px = image(24, 12, |x, _| if x % 3 == 0 { [0, 0, 0] } else { [255, 255, 255] });
+        let m = Mosaic::new(&px, 24, 12, 12);
+        assert_eq!((m.cols, m.rows), (2, 1));
+        assert_eq!(&m.bgra[..4], &[170, 170, 170, 255]);
+        assert_eq!(&m.bgra[4..8], &[170, 170, 170, 255]);
+        // Odd sums round to nearest.
+        let px = image(2, 1, |x, _| [x as u8, 0, 0]);
+        assert_eq!(Mosaic::new(&px, 2, 1, 2).bgra[0], 1); // (0 + 1) / 2 rounds up
+        // A short buffer never panics.
+        let m = Mosaic::new(&px, 2, 5, 2);
+        assert_eq!((m.cols, m.rows), (1, 1));
+    }
+
+    #[test]
+    fn new_kinds_have_names_and_classes() {
+        assert_eq!(Kind::from_name("pixelate"), Some(Kind::Pixelate));
+        assert!(Kind::Pen.is_freehand() && Kind::Highlighter.is_freehand() && !Kind::Line.is_freehand());
+        assert!(Kind::Pixelate.is_box() && !Kind::Text.is_box());
     }
 
     #[test]

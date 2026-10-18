@@ -1,7 +1,8 @@
 //! Annotation editor in the spirit of macOS Markup: the capture with a toolbar
-//! to draw lines, arrows, rectangles and ellipses (width and colour), select,
-//! move, reshape and restyle them, with undo/redo. Done renders the shapes into
-//! the image; main.rs writes it over the PNG and slides in a fresh thumbnail.
+//! to draw lines, arrows, rectangles, ellipses, pen and highlighter strokes,
+//! text and pixelated areas (width and colour), select, move, reshape and
+//! restyle them, with undo/redo. Done renders the shapes into the image;
+//! main.rs writes it over the PNG and slides in a fresh thumbnail.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -28,24 +29,26 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VIRTUAL_KEY, VK_BACK,
-    VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
+    VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_SHIFT,
+    VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetSystemMetrics,
-    GetWindowLongPtrW, KillTimer, LoadCursorW, MessageBoxW, PostMessageW, RegisterClassExW, SendMessageW,
-    SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    CW_USEDEFAULT, GWLP_USERDATA, HTCLIENT, IDC_ARROW, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS,
-    IDC_SIZENWSE, IDC_SIZEWE, IDNO, IDYES, MB_DEFBUTTON2, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO,
-    MB_YESNOCANCEL, MINMAXINFO, SIZE_MINIMIZED, SM_CXDRAG, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT,
-    WM_SETCURSOR, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCaretBlinkTime, GetClientRect, GetCursorPos,
+    GetSystemMetrics, GetWindowLongPtrW, KillTimer, LoadCursorW, MessageBoxW, PostMessageW, RegisterClassExW,
+    SendMessageW, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
+    ShowWindow, CS_DBLCLKS, CW_USEDEFAULT, GWLP_USERDATA, HTCLIENT, IDC_ARROW, IDC_CROSS, IDC_IBEAM, IDC_SIZEALL,
+    IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDNO, IDYES, MB_DEFBUTTON2, MB_ICONQUESTION,
+    MB_ICONWARNING, MB_OK, MB_YESNO, MB_YESNOCANCEL, MINMAXINFO, SIZE_MINIMIZED, SM_CXDRAG, SWP_NOACTIVATE,
+    SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
+    WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 
 use crate::capture::{monitor_at, monitor_dpi, Image};
-use crate::d2d::{self, Canvas, Fonts, RectF, Target};
+use crate::d2d::{self, Canvas, Fonts, RectF, Target, TextBox, HIGHLIGHTER_ALPHA};
 use crate::dragdrop;
-use crate::shapes::{Doc, Handle, Kind, Pt, Shape, Style};
+use crate::shapes::{Doc, Handle, Kind, Mosaic, Pt, Shape, Style};
 use crate::thumbnail::FileResult;
 use crate::util::{from_wide, get_x, get_y, hiword, log, loword, rect_h, rect_w, wide};
 
@@ -149,6 +152,7 @@ const CLASS_NAME: PCWSTR = w!("SgCapEditor");
 const TIMER_TOAST: usize = 1;
 const TIMER_RETRY: usize = 2;
 const TIMER_FILE: usize = 3;
+const TIMER_CARET: usize = 4;
 const TOAST_MS: u128 = 1600;
 const TOAST_FADE_MS: u128 = 300;
 
@@ -168,6 +172,17 @@ const WIDTHS_PT: [u32; 4] = [2, 4, 7, 12];
 const WIDTH_NAMES: [&str; 4] = ["Thin", "Medium", "Thick", "Extra thick"];
 /// How thick each width preset looks in the toolbar (pixels at 96 dpi).
 const WIDTH_ICONS: [f32; 4] = [1.5, 3.0, 5.0, 8.0];
+/// Text sizes in points that the width presets give text.
+const TEXT_PT: [f32; 4] = [14.0, 20.0, 28.0, 40.0];
+/// Highlighter strokes are this many times wider than the width preset.
+const HIGHLIGHTER_WIDTH: f32 = 3.0;
+/// Block size of pixelated areas in points: 12 px blocks leave no text readable.
+const PIXEL_BLOCK_PT: f32 = 12.0;
+/// Freehand strokes keep a point every this many screen pixels...
+const FREEHAND_STEP: f32 = 1.5;
+/// ...then drop the ones within this distance of the line through their
+/// neighbours (screen pixels) when the stroke ends.
+const FREEHAND_TOL: f32 = 0.4;
 const ACCENT: u32 = 0x0A84FF;
 const DONE_BLUE: u32 = 0x0067C0;
 
@@ -214,6 +229,10 @@ impl Item {
             Item::Tool(Kind::Arrow) => "Arrow (A)".into(),
             Item::Tool(Kind::Rect) => "Rectangle (R)".into(),
             Item::Tool(Kind::Ellipse) => "Ellipse (E)".into(),
+            Item::Tool(Kind::Pen) => "Pen (P)".into(),
+            Item::Tool(Kind::Highlighter) => "Highlighter (H)".into(),
+            Item::Tool(Kind::Text) => "Text (T)".into(),
+            Item::Tool(Kind::Pixelate) => "Pixelate, to hide details (B)".into(),
             Item::Width(i) => format!("{} ({})", WIDTH_NAMES[i], i + 1),
             Item::Color(i) => PALETTE[i].1.into(),
             Item::MoreColors => "More colours...".into(),
@@ -400,6 +419,85 @@ fn moved_enough(origin: POINT, pt: POINT) -> bool {
     (pt.x - origin.x).abs() >= th || (pt.y - origin.y).abs() >= th
 }
 
+/// Text size in points for a stroke width in points: the presets give
+/// TEXT_PT, other widths (hand-edited settings) something in between.
+fn text_pt(width_pt: u32) -> f32 {
+    let w = width_pt as f32;
+    let at = |i: usize| (WIDTHS_PT[i] as f32, TEXT_PT[i]);
+    if w <= at(0).0 {
+        return at(0).1;
+    }
+    for i in 1..WIDTHS_PT.len() {
+        let ((w0, t0), (w1, t1)) = (at(i - 1), at(i));
+        if w <= w1 {
+            return t0 + (t1 - t0) * (w - w0) / (w1 - w0);
+        }
+    }
+    let (w1, t1) = at(WIDTHS_PT.len() - 1);
+    t1 * w / w1
+}
+
+fn utf16_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+/// Byte offset in `s` of UTF-16 offset `pos` (DirectWrite counts in UTF-16).
+fn byte_at_utf16(s: &str, pos: usize) -> usize {
+    let mut n = 0;
+    for (i, c) in s.char_indices() {
+        if n >= pos {
+            return i;
+        }
+        n += c.len_utf16();
+    }
+    s.len()
+}
+
+/// Caret (byte offset) nearest to image point `p` in a text shape.
+fn caret_at(s: &Shape, p: Pt) -> usize {
+    match TextBox::new(&s.text, s.style.width) {
+        Ok(t) => byte_at_utf16(&s.text, t.hit(p.x - s.a.x, p.y - s.a.y)),
+        Err(_) => s.text.len(),
+    }
+}
+
+/// Caret moves and deletions in typed text: each takes the text and the
+/// caret (a byte offset on a char boundary) and returns the new caret.
+mod caret {
+    pub fn left(t: &str, c: usize) -> usize {
+        t[..c].chars().next_back().map_or(c, |ch| c - ch.len_utf8())
+    }
+
+    pub fn right(t: &str, c: usize) -> usize {
+        t[c..].chars().next().map_or(c, |ch| c + ch.len_utf8())
+    }
+
+    pub fn home(t: &str, c: usize) -> usize {
+        t[..c].rfind('\n').map_or(0, |i| i + 1)
+    }
+
+    pub fn end(t: &str, c: usize) -> usize {
+        t[c..].find('\n').map_or(t.len(), |i| c + i)
+    }
+
+    pub fn backspace(t: &mut String, c: usize) -> usize {
+        let n = left(t, c);
+        t.replace_range(n..c, "");
+        n
+    }
+
+    pub fn delete(t: &mut String, c: usize) -> usize {
+        let n = right(t, c);
+        t.replace_range(c..n, "");
+        c
+    }
+
+    pub fn insert(t: &mut String, c: usize, s: &str) -> usize {
+        t.insert_str(c, s);
+        c + s.len()
+    }
+}
+
 fn bgr(rgb: u32) -> COLORREF {
     COLORREF(((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF))
 }
@@ -476,6 +574,15 @@ enum Hit {
     Empty,
 }
 
+/// Text being typed into a text shape.
+struct TextEdit {
+    idx: usize,
+    /// Byte offset of the caret in the shape's text.
+    caret: usize,
+    /// The shapes before the edit began: the whole edit is one undo step.
+    before: Vec<Shape>,
+}
+
 struct State {
     image: Arc<Image>,
     file: PendingFile,
@@ -487,6 +594,14 @@ struct State {
     width_pt: u32,
     initial: Prefs,
     drag: Drag,
+    editing: Option<TextEdit>,
+    /// Blink phase of the text caret.
+    caret_on: bool,
+    /// First half of a character outside the BMP typed as two WM_CHARs.
+    high_surrogate: Option<u16>,
+    /// The capture averaged into blocks for pixelated areas, made the first
+    /// time one is drawn.
+    mosaic: Option<Mosaic>,
     /// The last commit was an arrow-key nudge still in progress: further
     /// nudges join that undo step.
     nudging: bool,
@@ -525,24 +640,33 @@ impl State {
         (self.image.width as f32, self.image.height as f32)
     }
 
-    /// Stroke width in whole image pixels for a width in points.
-    fn width_px(&self, pt: u32) -> f32 {
-        (pt as f32 * self.capture_scale).round().max(1.0)
+    /// Style::width in whole image pixels for a kind of shape and a width
+    /// preset in points: the stroke width, three times it for highlighters,
+    /// the matching font size for text, a fixed block size for pixelation.
+    fn style_width(&self, kind: Kind, width_pt: u32) -> f32 {
+        let px = |pt: f32| (pt * self.capture_scale).round().max(1.0);
+        match kind {
+            Kind::Highlighter => px(width_pt as f32) * HIGHLIGHTER_WIDTH,
+            Kind::Text => px(text_pt(width_pt)),
+            Kind::Pixelate => px(PIXEL_BLOCK_PT),
+            Kind::Line | Kind::Arrow | Kind::Rect | Kind::Ellipse | Kind::Pen => px(width_pt as f32),
+        }
     }
 
     fn current_style(&self) -> Style {
         Style {
             color: self.color,
-            width: self.width_px(self.width_pt),
+            width: self.style_width(self.tool, self.width_pt),
         }
     }
 
-    /// The toolbar shows the selected shape's style, or the one for new shapes.
-    fn shown_style(&self) -> Style {
+    /// The toolbar shows the selected shape's kind and style, or the ones
+    /// for new shapes.
+    fn shown(&self) -> (Kind, Style) {
         self.selected
             .and_then(|i| self.doc.shapes.get(i))
-            .map(|s| s.style)
-            .unwrap_or_else(|| self.current_style())
+            .map(|s| (s.kind, s.style))
+            .unwrap_or_else(|| (self.tool, self.current_style()))
     }
 
     fn relayout(&mut self) {
@@ -604,16 +728,20 @@ impl State {
             Item::Undo => self.doc.can_undo(),
             Item::Redo => self.doc.can_redo(),
             Item::Delete => self.selected.is_some(),
+            // Pixelated areas have neither colour nor width.
+            Item::Width(_) | Item::Color(_) | Item::MoreColors => self.shown().0 != Kind::Pixelate,
             _ => true,
         }
     }
 
-    fn is_active(&self, item: Item, shown: &Style) -> bool {
+    fn is_active(&self, item: Item, shown: (Kind, Style)) -> bool {
+        let (kind, style) = shown;
         match item {
             Item::Tool(k) => self.tool == k,
-            Item::Width(i) => (self.width_px(WIDTHS_PT[i]) - shown.width).abs() < 0.01,
-            Item::Color(i) => PALETTE[i].0 == shown.color,
-            Item::MoreColors => !PALETTE.iter().any(|p| p.0 == shown.color),
+            _ if !self.enabled(item) => false,
+            Item::Width(i) => (self.style_width(kind, WIDTHS_PT[i]) - style.width).abs() < 0.01,
+            Item::Color(i) => PALETTE[i].0 == style.color,
+            Item::MoreColors => !PALETTE.iter().any(|p| p.0 == style.color),
             _ => false,
         }
     }
@@ -670,17 +798,43 @@ impl State {
             Handle::N | Handle::S => IDC_SIZENS,
             Handle::E | Handle::W => IDC_SIZEWE,
         };
+        let text_tool = self.tool == Kind::Text;
         match &self.drag {
             Drag::Move { .. } => IDC_SIZEALL,
             Drag::Reshape { handle, .. } => handle_cursor(*handle),
             Drag::Create { .. } => IDC_CROSS,
             Drag::Press(_) => IDC_ARROW,
+            Drag::Idle if self.in_edited_text(pt) => IDC_IBEAM,
             Drag::Idle => match self.hit_at(pt) {
                 Hit::Handle(_, h) => handle_cursor(h),
+                // With the Text tool a click on text edits it.
+                Hit::Shape(i) if text_tool && self.doc.shapes[i].kind == Kind::Text => IDC_IBEAM,
                 Hit::Shape(_) => IDC_SIZEALL,
+                Hit::Empty if text_tool => IDC_IBEAM,
                 Hit::Empty => IDC_CROSS,
             },
         }
+    }
+
+    /// Is `pt` on the text being typed?
+    fn in_edited_text(&self, pt: POINT) -> bool {
+        let tol = HIT_TOL * self.k() / self.view_scale;
+        self.editing
+            .as_ref()
+            .and_then(|e| self.doc.shapes.get(e.idx))
+            .is_some_and(|s| pt.y >= self.lay.bar_h && s.hit(self.to_img(pt), tol))
+    }
+
+    /// The capture's mosaic, for pixelated areas.
+    fn ensure_mosaic(&mut self) {
+        let block = self.style_width(Kind::Pixelate, 0) as u32;
+        if self.mosaic.as_ref().is_some_and(|m| m.block == block) {
+            return;
+        }
+        let t0 = Instant::now();
+        let img = &self.image;
+        self.mosaic = Some(Mosaic::new(&img.bgra, img.width as usize, img.height as usize, block));
+        log(&format!("editor: {block} px mosaic made in {} ms", t0.elapsed().as_millis()));
     }
 
     /// Starts a drag for a press below the toolbar.
@@ -709,22 +863,33 @@ impl State {
                     idx,
                     before: self.doc.shapes.clone(),
                     start: p,
-                    orig: self.doc.shapes[idx],
+                    orig: self.doc.shapes[idx].clone(),
                     origin: pt,
                     started: false,
                 }
             }
             Hit::Empty => {
                 self.selected = None;
-                Drag::Create {
-                    shape: Shape {
-                        kind: self.tool,
-                        a: p,
-                        b: p,
-                        style: self.current_style(),
-                    },
-                    origin: pt,
-                    started: false,
+                let (iw, ih) = self.image_size();
+                match self.tool {
+                    // Text starts where it is clicked, typed at once (on the
+                    // image: the margin around it is clipped away).
+                    Kind::Text => {
+                        if p.x >= 0.0 && p.x < iw && p.y >= 0.0 && p.y < ih {
+                            self.begin_new_text(p);
+                        }
+                        Drag::Idle
+                    }
+                    tool => {
+                        if tool == Kind::Pixelate {
+                            self.ensure_mosaic();
+                        }
+                        Drag::Create {
+                            shape: Shape::new(tool, p, p, self.current_style()),
+                            origin: pt,
+                            started: false,
+                        }
+                    }
                 }
             }
         };
@@ -735,13 +900,18 @@ impl State {
     /// only selects.
     fn apply_drag(&mut self, pt: POINT, shift: bool) -> bool {
         let p = self.to_img(pt);
+        let step = FREEHAND_STEP / self.view_scale;
         match &mut self.drag {
             Drag::Create { shape, origin, started } => {
                 if !*started && !moved_enough(*origin, pt) {
                     return false;
                 }
                 *started = true;
-                shape.set_end(p, shift);
+                if shape.kind.is_freehand() {
+                    shape.extend(p, shift, step);
+                } else {
+                    shape.set_end(p, shift);
+                }
                 shape.snap_to_pixels();
                 true
             }
@@ -766,7 +936,7 @@ impl State {
                         d.x = 0.0;
                     }
                 }
-                let mut moved = *orig;
+                let mut moved = orig.clone();
                 moved.translate(d);
                 moved.snap_to_pixels();
                 if let Some(s) = self.doc.shapes.get_mut(*idx) {
@@ -805,6 +975,7 @@ impl State {
             Drag::Create {
                 mut shape, started, ..
             } => {
+                shape.simplify(FREEHAND_TOL / self.view_scale);
                 // Shapes entirely off the image would be invisible yet count.
                 if started && !shape.is_degenerate(2.0 / self.view_scale) && shape.touches_image(iw, ih) {
                     shape.normalize();
@@ -813,6 +984,18 @@ impl State {
                     self.doc.shapes.push(shape);
                     self.doc.commit(before);
                     self.selected = Some(self.doc.shapes.len() - 1);
+                }
+                None
+            }
+            Drag::Move {
+                idx,
+                started: false,
+                start,
+                ..
+            } => {
+                // A click on text with the Text tool edits it.
+                if self.tool == Kind::Text && self.doc.shapes.get(idx).is_some_and(|s| s.kind == Kind::Text) {
+                    self.begin_edit(idx, Some(start));
                 }
                 None
             }
@@ -869,8 +1052,14 @@ impl State {
         let Some(i) = self.selected else {
             return;
         };
+        let Some(kind) = self.doc.shapes.get(i).map(|s| s.kind) else {
+            return;
+        };
+        if kind == Kind::Pixelate {
+            return;
+        }
         let before = self.doc.shapes.clone();
-        let width = self.width_px(self.width_pt);
+        let width = self.style_width(kind, self.width_pt);
         if let Some(s) = self.doc.shapes.get_mut(i) {
             if let Some(c) = color {
                 s.style.color = c;
@@ -881,7 +1070,129 @@ impl State {
                 s.snap_to_pixels();
             }
         }
-        self.doc.commit(before);
+        self.fit_text(i);
+        // Text being typed: the restyle is part of the edit's undo step.
+        if self.editing.is_none() {
+            self.doc.commit(before);
+        }
+    }
+
+    /// Text shapes: b follows the laid-out text (an empty one keeps room
+    /// for the caret).
+    fn fit_text(&mut self, idx: usize) {
+        let Some(s) = self.doc.shapes.get_mut(idx).filter(|s| s.kind == Kind::Text) else {
+            return;
+        };
+        let size = s.style.width;
+        let (w, h) = match TextBox::new(&s.text, size) {
+            Ok(t) => t.extent(),
+            Err(e) => {
+                log(&format!("editor: text layout failed: {e}"));
+                (0.0, size * 1.33)
+            }
+        };
+        s.b = Pt::new(s.a.x + w.max(size * 0.3).ceil(), s.a.y + h.max(1.0).ceil());
+    }
+
+    /// Starts typing a new text whose first line is centred on `p`.
+    fn begin_new_text(&mut self, p: Pt) {
+        let before = self.doc.shapes.clone();
+        self.doc.shapes.push(Shape::new(Kind::Text, p, p, self.current_style()));
+        let idx = self.doc.shapes.len() - 1;
+        self.fit_text(idx);
+        let s = &mut self.doc.shapes[idx];
+        let h = s.b.y - s.a.y;
+        s.translate(Pt::new(0.0, -h * 0.5));
+        s.snap_to_pixels();
+        self.selected = Some(idx);
+        self.editing = Some(TextEdit { idx, caret: 0, before });
+        self.caret_on = true;
+    }
+
+    /// Edits text shape `idx`, the caret nearest to image point `at` (else
+    /// at the end).
+    fn begin_edit(&mut self, idx: usize, at: Option<Pt>) {
+        let Some(s) = self.doc.shapes.get(idx).filter(|s| s.kind == Kind::Text) else {
+            return;
+        };
+        let caret = match at {
+            Some(p) => caret_at(s, p),
+            None => s.text.len(),
+        };
+        self.editing = Some(TextEdit {
+            idx,
+            caret,
+            before: self.doc.shapes.clone(),
+        });
+        self.selected = Some(idx);
+        self.caret_on = true;
+    }
+
+    /// Stops typing: the whole edit becomes one undo step, and text left
+    /// blank goes away. True if text was being typed.
+    fn end_edit(&mut self) -> bool {
+        let Some(e) = self.editing.take() else {
+            return false;
+        };
+        if self.doc.shapes.get(e.idx).is_some_and(|s| s.is_empty_text()) {
+            self.doc.shapes.remove(e.idx);
+            self.selected = None;
+        }
+        self.doc.commit(e.before);
+        true
+    }
+
+    /// Applies `f(text, caret) -> caret` to the text being typed.
+    fn edit(&mut self, f: impl FnOnce(&mut String, usize) -> usize) -> bool {
+        let Some(e) = &mut self.editing else {
+            return false;
+        };
+        let Some(s) = self.doc.shapes.get_mut(e.idx) else {
+            return false;
+        };
+        let at = e.caret.min(s.text.len());
+        e.caret = f(&mut s.text, at);
+        let idx = e.idx;
+        self.fit_text(idx);
+        self.caret_on = true;
+        true
+    }
+
+    /// Up and Down: the caret moves a line, keeping its x.
+    fn edit_line(&mut self, down: bool) -> bool {
+        let Some(e) = &self.editing else {
+            return false;
+        };
+        let Some(s) = self.doc.shapes.get(e.idx) else {
+            return false;
+        };
+        let Ok(tb) = TextBox::new(&s.text, s.style.width) else {
+            return false;
+        };
+        let caret = e.caret.min(s.text.len());
+        let (x, y, h) = tb.caret(utf16_len(&s.text[..caret]));
+        let target = if down { y + h * 1.5 } else { y - h * 0.5 };
+        let to = if target < 0.0 {
+            0
+        } else if target > s.b.y - s.a.y {
+            s.text.len()
+        } else {
+            byte_at_utf16(&s.text, tb.hit(x, target))
+        };
+        self.edit(|_, _| to)
+    }
+
+    /// A press inside the text being typed moves the caret there.
+    fn place_caret(&mut self, pt: POINT) {
+        let p = self.to_img(pt);
+        let Some(e) = &self.editing else {
+            return;
+        };
+        let Some(s) = self.doc.shapes.get(e.idx) else {
+            return;
+        };
+        let to = caret_at(s, p);
+        self.edit(|_, _| to);
     }
 
     /// Arrow keys: one held key (its auto-repeats) is a single undo step.
@@ -892,7 +1203,7 @@ impl State {
         if !matches!(self.drag, Drag::Idle) {
             return false;
         }
-        let Some(mut moved) = self.doc.shapes.get(i).copied() else {
+        let Some(mut moved) = self.doc.shapes.get(i).cloned() else {
             return false;
         };
         moved.translate(Pt::new(dx, dy));
@@ -908,8 +1219,9 @@ impl State {
         true
     }
 
+    /// Anything drawn (text still empty does not count).
     fn dirty(&self) -> bool {
-        !self.doc.shapes.is_empty()
+        self.doc.shapes.iter().any(|s| !s.is_empty_text())
     }
 
     fn prefs(&self) -> Prefs {
@@ -944,16 +1256,35 @@ fn draw(c: &Canvas, s: &State) {
     c.pop_clip();
 
     if let Some(shape) = s.selected.and_then(|i| s.doc.shapes.get(i)) {
-        // An ellipse's handles sit on its bounding box: show that box.
-        if shape.kind == Kind::Ellipse {
+        // Shapes without an outline on their bounds show the box: ellipses
+        // and pixelated areas (their handles sit on it), text and strokes.
+        let frame = match shape.kind {
+            Kind::Ellipse | Kind::Pixelate => Some(0.0),
+            Kind::Text => Some(3.0 * k),
+            Kind::Pen | Kind::Highlighter => Some(shape.style.width * 0.5 * s.view_scale + 3.0 * k),
+            Kind::Line | Kind::Arrow | Kind::Rect => None,
+        };
+        if let Some(pad) = frame {
             let (lo, hi) = shape.bounds();
             let (a, b) = (s.to_view(lo), s.to_view(hi));
-            c.stroke_rect(RectF { l: a.x, t: a.y, r: b.x, b: b.y }, ACCENT, 0.7, 1.0);
+            let r = RectF { l: a.x, t: a.y, r: b.x, b: b.y }.inset(-pad);
+            c.stroke_rect(r, ACCENT, 0.7, 1.0);
         }
         for (_, p) in shape.handles() {
             let q = s.to_view(p);
             c.fill_circle(q, HANDLE_R * k, 0xFFFFFF, 1.0);
             c.stroke_circle(q, HANDLE_R * k, ACCENT, 1.0, 1.5 * k);
+        }
+    }
+    if let Some((e, t)) = s.editing.as_ref().and_then(|e| s.doc.shapes.get(e.idx).map(|t| (e, t))) {
+        if s.caret_on {
+            if let Ok(tb) = TextBox::new(&t.text, t.style.width) {
+                let (x, y, h) = tb.caret(utf16_len(&t.text[..e.caret.min(t.text.len())]));
+                let top = s.to_view(Pt::new(t.a.x + x, t.a.y + y));
+                let bottom = s.to_view(Pt::new(t.a.x + x, t.a.y + y + h));
+                let half = (k * 0.75).max(0.5);
+                c.fill_rect(RectF { l: top.x - half, t: top.y, r: top.x + half, b: bottom.y }, t.style.color, 1.0);
+            }
         }
     }
 
@@ -975,14 +1306,14 @@ fn draw_toolbar(c: &Canvas, s: &State, th: &Theme) {
         let x = x as f32;
         c.fill_rect(RectF { l: x, t: bar * 0.27, r: x + hair, b: bar * 0.73 }, th.line, 1.0);
     }
-    let shown = s.shown_style();
+    let shown = s.shown();
     let radius = 6.0 * k;
     for &(item, r) in &s.lay.buttons {
         let rf = RectF::from(r);
         let enabled = s.enabled(item);
         let hover = enabled && s.hover == Some(item);
         let pressed = hover && matches!(s.drag, Drag::Press(p) if p == item);
-        let active = s.is_active(item, &shown);
+        let active = s.is_active(item, shown);
         let fg = if enabled { th.icon } else { th.dim };
         let ctr = Pt::new((rf.l + rf.r) * 0.5, (rf.t + rf.b) * 0.5);
         match item {
@@ -1009,13 +1340,14 @@ fn draw_toolbar(c: &Canvas, s: &State, th: &Theme) {
                 }
                 let color = match item {
                     Item::Color(i) => Some(PALETTE[i].0),
-                    _ if active => Some(shown.color),
+                    _ if active => Some(shown.1.color),
                     _ => None,
                 };
+                let a = if enabled { 1.0 } else { 0.3 };
                 match color {
                     Some(col) => {
-                        c.fill_circle(ctr, 9.0 * k, col, 1.0);
-                        c.stroke_circle(ctr, 9.0 * k - 0.5, th.swatch_edge.0, th.swatch_edge.1, 1.0);
+                        c.fill_circle(ctr, 9.0 * k, col, a);
+                        c.stroke_circle(ctr, 9.0 * k - 0.5, th.swatch_edge.0, th.swatch_edge.1 * a, 1.0);
                         if active {
                             c.stroke_circle(ctr, 12.0 * k, th.icon, 1.0, 2.0 * k);
                         }
@@ -1055,6 +1387,44 @@ fn draw_icon(c: &Canvas, item: Item, ctr: Pt, k: f32, fg: u32, rf: RectF, fonts:
             1.8 * k,
         ),
         Item::Tool(Kind::Ellipse) => c.stroke_ellipse(ctr, 8.5 * k, 6.5 * k, fg, 1.0, 1.8 * k),
+        Item::Tool(Kind::Pen) => {
+            // A squiggle: one period of a sine.
+            let wave: Vec<Pt> = (0..=16)
+                .map(|i| {
+                    let x = i as f32 - 8.0;
+                    at(x, -4.5 * (x * std::f32::consts::PI / 8.0).sin())
+                })
+                .collect();
+            c.stroke_points(&wave, fg, 1.0, 1.8 * k);
+        }
+        Item::Tool(Kind::Highlighter) => {
+            // A marker leaning right, its chisel tip on a translucent band.
+            c.line(at(-9.0, 6.5), at(3.0, 6.5), fg, HIGHLIGHTER_ALPHA, 4.5 * k);
+            let (b0, b1, e0, e1) = (at(0.6, 3.6), at(-3.6, -0.6), at(8.4, -4.1), at(4.1, -8.4));
+            for (p, q) in [(b0, b1), (b1, e1), (e1, e0), (e0, b0)] {
+                c.line(p, q, fg, 1.0, 1.5 * k);
+            }
+            c.fill_triangle(b0, b1, at(-4.0, 4.0), fg, 1.0);
+        }
+        Item::Tool(Kind::Text) => {
+            c.line(at(-6.0, -7.0), at(6.0, -7.0), fg, 1.0, 2.2 * k);
+            c.line(at(0.0, -7.0), at(0.0, 7.5), fg, 1.0, 2.2 * k);
+        }
+        Item::Tool(Kind::Pixelate) => {
+            for i in 0..3 {
+                for j in 0..3 {
+                    let (x, y) = (-7.5 + 5.0 * i as f32, -7.5 + 5.0 * j as f32);
+                    let a = if (i + j) % 2 == 0 { 1.0 } else { 0.35 };
+                    let r = RectF {
+                        l: ctr.x + x * k,
+                        t: ctr.y + y * k,
+                        r: ctr.x + (x + 5.0) * k,
+                        b: ctr.y + (y + 5.0) * k,
+                    };
+                    c.fill_rect(r, fg, a);
+                }
+            }
+        }
         Item::Width(i) => c.line(at(-8.0, 0.0), at(8.0, 0.0), fg, 1.0, WIDTH_ICONS[i] * k),
         Item::Undo => c.text("\u{E7A7}", rf, &fonts.icons, fg, 1.0),
         Item::Redo => c.text("\u{E7A6}", rf, &fonts.icons, fg, 1.0),
@@ -1151,7 +1521,7 @@ impl Editor {
                     let v = s.view_rect();
                     t.prepare_view((v.r - v.l).round() as u32, (v.b - v.t).round() as u32);
                 }
-                match t.draw(|c| draw(c, s)) {
+                match t.draw(s.mosaic.as_ref(), |c| draw(c, s)) {
                     Err(e) if d2d::needs_recreate(&e) => recreate = true,
                     Err(e) => log(&format!("editor: draw failed: {e}")),
                     Ok(()) => {}
@@ -1255,7 +1625,12 @@ impl Editor {
                     }
                     _ => false,
                 }
+            } else if s.in_edited_text(pt) {
+                s.place_caret(pt);
+                false
             } else {
+                // A press anywhere else finishes the text being typed.
+                s.end_edit();
                 s.begin_drag(pt);
                 true
             }
@@ -1265,7 +1640,130 @@ impl Editor {
                 SetCapture(self.hwnd);
             }
         }
+        self.restart_caret();
         self.invalidate();
+    }
+
+    /// A double-click on text edits it, whatever the tool; anything else is
+    /// an ordinary press.
+    fn on_double_click(&self, pt: POINT) {
+        let edit = {
+            let Ok(mut guard) = self.state.try_borrow_mut() else {
+                return;
+            };
+            let s = &mut *guard;
+            let idle = !s.closed && matches!(s.drag, Drag::Idle) && s.editing.is_none() && pt.y >= s.lay.bar_h;
+            match s.hit_at(pt) {
+                Hit::Shape(i) if idle && s.doc.shapes[i].kind == Kind::Text => {
+                    let p = s.to_img(pt);
+                    s.begin_edit(i, Some(p));
+                    true
+                }
+                _ => false,
+            }
+        };
+        if edit {
+            self.restart_caret();
+            self.invalidate();
+        } else {
+            self.on_down(pt);
+        }
+    }
+
+    /// Restarts the caret's blink (shown at once), or stops it when no text
+    /// is being typed.
+    fn restart_caret(&self) {
+        let editing = self
+            .state
+            .try_borrow_mut()
+            .map(|mut s| {
+                s.caret_on = true;
+                s.editing.is_some()
+            })
+            .unwrap_or(false);
+        unsafe {
+            let ms = GetCaretBlinkTime();
+            // INFINITE (u32::MAX): the caret does not blink.
+            if editing && ms != 0 && ms != u32::MAX {
+                SetTimer(Some(self.hwnd), TIMER_CARET, ms, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), TIMER_CARET);
+            }
+        }
+    }
+
+    /// WM_CHAR: typed text goes into the text being edited.
+    fn on_char(&self, unit: u16) -> bool {
+        let typed = {
+            let Ok(mut s) = self.state.try_borrow_mut() else {
+                return false;
+            };
+            if s.closed || s.editing.is_none() {
+                return false;
+            }
+            if (0xD800..0xDC00).contains(&unit) {
+                s.high_surrogate = Some(unit);
+                return true;
+            }
+            let units = match s.high_surrogate.take() {
+                Some(high) => vec![high, unit],
+                None => vec![unit],
+            };
+            // Control characters (Enter, Backspace, Ctrl+letter) are keys.
+            let text: String = char::decode_utf16(units)
+                .filter_map(|c| c.ok())
+                .filter(|c| !c.is_control())
+                .collect();
+            !text.is_empty() && s.edit(|t, c| caret::insert(t, c, &text))
+        };
+        if typed {
+            self.restart_caret();
+            self.invalidate();
+        }
+        true
+    }
+
+    /// Keys while text is being typed: None for those the editor handles as
+    /// usual (Ctrl shortcuts), else whether the key was used.
+    fn edit_key(&self, vk: u16, ctrl: bool) -> Option<bool> {
+        let paste = ctrl && vk == 0x56; // V
+        if ctrl && !paste && vk != VK_LEFT.0 && vk != VK_RIGHT.0 && vk != VK_HOME.0 && vk != VK_END.0 {
+            return None;
+        }
+        let clip = if paste { dragdrop::clipboard_text(self.hwnd) } else { None };
+        let changed = {
+            let Ok(mut s) = self.state.try_borrow_mut() else {
+                return Some(true);
+            };
+            if s.editing.is_none() {
+                return None;
+            }
+            match vk {
+                v if v == VK_ESCAPE.0 => s.end_edit(),
+                v if v == VK_RETURN.0 => s.edit(|t, c| caret::insert(t, c, "\n")),
+                v if v == VK_BACK.0 => s.edit(caret::backspace),
+                v if v == VK_DELETE.0 => s.edit(caret::delete),
+                v if v == VK_LEFT.0 => s.edit(|t, c| caret::left(t, c)),
+                v if v == VK_RIGHT.0 => s.edit(|t, c| caret::right(t, c)),
+                v if v == VK_HOME.0 && ctrl => s.edit(|_, _| 0),
+                v if v == VK_END.0 && ctrl => s.edit(|t, _| t.len()),
+                v if v == VK_HOME.0 => s.edit(|t, c| caret::home(t, c)),
+                v if v == VK_END.0 => s.edit(|t, c| caret::end(t, c)),
+                v if v == VK_UP.0 => s.edit_line(false),
+                v if v == VK_DOWN.0 => s.edit_line(true),
+                _ if paste => {
+                    let text: String = clip.unwrap_or_default().chars().filter(|&c| c == '\n' || !c.is_control()).collect();
+                    !text.is_empty() && s.edit(|t, c| caret::insert(t, c, &text))
+                }
+                // Typing arrives as WM_CHAR; no tool shortcut while typing.
+                _ => false,
+            }
+        };
+        if changed {
+            self.restart_caret();
+            self.invalidate();
+        }
+        Some(true)
     }
 
     fn on_move(&self, pt: POINT) {
@@ -1323,6 +1821,7 @@ impl Editor {
         if let Some(item) = activate {
             self.activate(item);
         }
+        self.restart_caret();
         self.invalidate();
     }
 
@@ -1357,6 +1856,9 @@ impl Editor {
         if key_down(VK_MENU) {
             return false;
         }
+        if let Some(used) = self.edit_key(vk, ctrl) {
+            return used;
+        }
         // Only nudges and undo/redo repeat: a held Enter, Esc or Delete acts once.
         let repeatable = arrow || (ctrl && (vk == 0x5A || vk == 0x59));
         if repeat && !repeatable {
@@ -1372,6 +1874,10 @@ impl Editor {
             0x41 => Some(Item::Tool(Kind::Arrow)),           // A
             0x52 => Some(Item::Tool(Kind::Rect)),            // R
             0x45 | 0x4F => Some(Item::Tool(Kind::Ellipse)), // E, O
+            0x50 => Some(Item::Tool(Kind::Pen)),             // P
+            0x48 => Some(Item::Tool(Kind::Highlighter)),     // H
+            0x54 => Some(Item::Tool(Kind::Text)),            // T
+            0x42 => Some(Item::Tool(Kind::Pixelate)),        // B (blur)
             0x31..=0x34 => Some(Item::Width((vk - 0x31) as usize)),
             v if v == VK_RETURN.0 => Some(Item::Done),
             v if v == VK_DELETE.0 || v == VK_BACK.0 => Some(Item::Delete),
@@ -1440,6 +1946,11 @@ impl Editor {
     }
 
     fn activate(&self, item: Item) {
+        // Width and colour restyle the text being typed; anything else
+        // finishes it first.
+        if !matches!(item, Item::Width(_) | Item::Color(_) | Item::MoreColors) {
+            self.end_edit();
+        }
         match item {
             Item::MoreColors => return self.choose_color(),
             Item::Copy => return self.copy(),
@@ -1490,9 +2001,16 @@ impl Editor {
         self.invalidate();
     }
 
+    fn end_edit(&self) {
+        if let Ok(mut s) = self.state.try_borrow_mut() {
+            s.end_edit();
+        }
+        self.restart_caret();
+    }
+
     fn choose_color(&self) {
         let initial = match self.state.try_borrow() {
-            Ok(s) if !s.closed => s.shown_style().color,
+            Ok(s) if !s.closed => s.shown().1.color,
             _ => return,
         };
         let mut custom = CUSTOM_COLORS.with(|c| c.get());
@@ -1520,7 +2038,7 @@ impl Editor {
         if !s.dirty() {
             return None;
         }
-        Some(d2d::render_export(&s.image, &s.doc.shapes))
+        Some(d2d::render_export(&s.image, &s.doc.shapes, s.mosaic.as_ref()))
     }
 
     fn copy(&self) {
@@ -1597,6 +2115,7 @@ impl Editor {
             // One of our dialogs is already asking something.
             return;
         }
+        self.end_edit();
         if !self.is_dirty() {
             return self.finish(Outcome::Unchanged);
         }
@@ -1624,7 +2143,7 @@ impl Editor {
         if s.closed || !s.dirty() {
             return 0;
         }
-        match d2d::render_export(&s.image, &s.doc.shapes) {
+        match d2d::render_export(&s.image, &s.doc.shapes, s.mosaic.as_ref()) {
             Ok(image) => {
                 // No waiting at session end: an unfinished save leaves no name.
                 s.file.poll();
@@ -1758,6 +2277,17 @@ impl Editor {
                     self.on_down(pt());
                     Some(LRESULT(0))
                 }
+                WM_LBUTTONDBLCLK => {
+                    self.on_double_click(pt());
+                    Some(LRESULT(0))
+                }
+                WM_CHAR => {
+                    if self.on_char(wparam.0 as u16) {
+                        Some(LRESULT(0))
+                    } else {
+                        None
+                    }
+                }
                 WM_MOUSEMOVE => {
                     self.on_move(pt());
                     Some(LRESULT(0))
@@ -1824,6 +2354,12 @@ impl Editor {
                             self.invalidate();
                         }
                         TIMER_FILE => self.poll_file(),
+                        TIMER_CARET => {
+                            if let Ok(mut s) = self.state.try_borrow_mut() {
+                                s.caret_on = !s.caret_on;
+                            }
+                            self.invalidate();
+                        }
                         _ => {}
                     }
                     Some(LRESULT(0))
@@ -1887,6 +2423,8 @@ fn register_class(hinst: HINSTANCE) {
     unsafe {
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            // Double-clicks edit text.
+            style: CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             hInstance: hinst,
             hIcon: crate::tray::load_app_icon(32).unwrap_or_default(),
@@ -2005,6 +2543,10 @@ pub fn open(
         width_pt: initial.width_pt,
         initial,
         drag: Drag::Idle,
+        editing: None,
+        caret_on: true,
+        high_surrogate: None,
+        mosaic: None,
         nudging: false,
         last_mouse: POINT::default(),
         hover: None,
@@ -2049,4 +2591,54 @@ pub fn open(
         let _ = SetForegroundWindow(hwnd);
     }
     Ok(hwnd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn width_presets_give_text_sizes() {
+        for (i, &w) in WIDTHS_PT.iter().enumerate() {
+            assert_eq!(text_pt(w), TEXT_PT[i]);
+        }
+        assert_eq!(text_pt(1), 14.0);
+        assert_eq!(text_pt(3), 17.0);
+        assert_eq!(text_pt(24), 80.0);
+    }
+
+    #[test]
+    fn utf16_offsets_map_to_bytes() {
+        let s = "a\u{e9}\u{1F600}b";
+        assert_eq!(utf16_len(s), 5);
+        assert_eq!(byte_at_utf16(s, 0), 0);
+        assert_eq!(byte_at_utf16(s, 1), 1);
+        assert_eq!(byte_at_utf16(s, 2), 3);
+        assert_eq!(byte_at_utf16(s, 4), 7);
+        assert_eq!(byte_at_utf16(s, 5), 8);
+        assert_eq!(byte_at_utf16(s, 99), 8);
+    }
+
+    #[test]
+    fn caret_moves_and_edits() {
+        let mut t = String::from("ab\ncd\u{e9}");
+        let mut c = caret::left(&t, t.len());
+        assert_eq!(&t[c..], "\u{e9}");
+        c = caret::home(&t, c);
+        assert_eq!(c, 3);
+        assert_eq!(caret::left(&t, c), 2, "back over the newline");
+        assert_eq!(caret::end(&t, 0), 2);
+        assert_eq!(caret::end(&t, 3), t.len());
+        let end = t.len();
+        c = caret::backspace(&mut t, end);
+        assert_eq!((t.as_str(), c), ("ab\ncd", 5));
+        c = caret::insert(&mut t, 2, "\u{20ac}");
+        assert_eq!((t.as_str(), c), ("ab\u{20ac}\ncd", 5));
+        c = caret::delete(&mut t, c);
+        assert_eq!((t.as_str(), c), ("ab\u{20ac}cd", 5));
+        assert_eq!(caret::backspace(&mut t, 0), 0);
+        assert_eq!(caret::right(&t, t.len()), t.len());
+        assert_eq!(caret::delete(&mut t, 7), 7);
+        assert_eq!(t, "ab\u{20ac}cd");
+    }
 }
